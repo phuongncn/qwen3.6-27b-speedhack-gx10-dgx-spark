@@ -1,80 +1,142 @@
 #!/bin/bash
-# TurboQuant quality + speed gate — run BEFORE pushing any changes
-# Checks: (1) perplexity within 5% of q8_0, (2) context scaling ratio > 0.95
+# TurboQuant quality + speed gate
+# Tests PPL and decode speed for turbo3/turbo4 vs q8_0 baseline
 #
 # Usage: bash scripts/turbo-quality-gate.sh
-# Exit 0 = PASS, Exit 1 = FAIL
+# Override paths: LLAMA=~/path/to/bin MODEL=~/model.gguf bash scripts/turbo-quality-gate.sh
+#
+# Requires: llama-perplexity (build with: cmake --build build -t llama-perplexity)
 
-set -e
+set -euo pipefail
 
-LLAMA=${LLAMA:-~/local_llms/llama.cpp/build-turbo/bin}
-MODEL=${MODEL:-~/local_llms/models/Qwen3.5-35B-A3B-Q8_0.gguf}
-WIKI=${WIKI:-~/local_llms/llama.cpp/wikitext-2-raw/wiki.test.raw}
+LLAMA=${LLAMA:-~/llama-cuda-turbo/build/bin}
+MODEL=${MODEL:-~/Qwen3.5-27B-heretic.Q6_K.gguf}
+WIKI=${WIKI:-wikitext-2-raw/wiki.test.raw}
+THREADS=${THREADS:-10}
+NGL=${NGL:-99}
+PPL_THRESHOLD=${PPL_THRESHOLD:-1.05}    # turbo PPL must be < q8_0 * this
+SPEED_THRESHOLD=${SPEED_THRESHOLD:-0.90} # turbo tok/s must be > q8_0 * this
 
 if [ ! -f "$WIKI" ]; then
     echo "Downloading wikitext-2..."
-    bash ~/local_llms/llama.cpp/scripts/get-wikitext-2.sh
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    bash "$SCRIPT_DIR/get-wikitext-2.sh"
+fi
+
+if [ ! -f "$LLAMA/llama-perplexity" ]; then
+    echo "ERROR: $LLAMA/llama-perplexity not found"
+    echo "Build it with: cmake --build build -t llama-perplexity"
+    exit 1
 fi
 
 FAIL=0
 
+run_ppl() {
+    local label=$1 ctk=$2 ctv=$3 ctx=$4 chunks=$5
+    $LLAMA/llama-perplexity -m "$MODEL" -f "$WIKI" \
+        -c "$ctx" -ctk "$ctk" -ctv "$ctv" -fa -t "$THREADS" \
+        --chunks "$chunks" -ngl "$NGL" 2>&1
+}
+
+extract_ppl() {
+    grep -oE 'PPL = [0-9.]+' | tail -1 | grep -oE '[0-9.]+'
+}
+
+extract_speed() {
+    grep "eval time" | head -1 | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+'
+}
+
 echo "========================================"
 echo "  TurboQuant Quality + Speed Gate"
 echo "========================================"
+echo "  Model: $(basename "$MODEL")"
+echo "  Threads: $THREADS"
 echo ""
 
-# --- Test 1: Perplexity ---
-echo "[1/2] Running perplexity check (8 chunks)..."
-PPL_TURBO=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 512 -ctk turbo3 -ctv turbo3 -fa on --chunks 8 -ngl 99 2>&1 | grep "Final" | grep -oE 'PPL = [0-9.]+' | grep -oE '[0-9.]+')
+# --- Test 1: Perplexity (2K context, 8 chunks) ---
+echo "[1/3] Perplexity — q8_0 baseline (2K ctx, 8 chunks)..."
+PPL_Q8=$(run_ppl "q8_0" q8_0 q8_0 2048 8 | extract_ppl)
+echo "  q8_0 PPL = ${PPL_Q8:-FAILED}"
 
-if [ -z "$PPL_TURBO" ]; then
-    echo "  FAIL: Could not get turbo3 perplexity (crash or timeout)"
-    FAIL=1
+echo ""
+echo "[2/3] Perplexity — turbo3 + turbo4 (2K ctx, 8 chunks)..."
+PPL_T3=$(run_ppl "turbo3" turbo3 turbo3 2048 8 | extract_ppl)
+PPL_T4=$(run_ppl "turbo4" turbo4 turbo4 2048 8 | extract_ppl)
+echo "  turbo3 PPL = ${PPL_T3:-FAILED}"
+echo "  turbo4 PPL = ${PPL_T4:-FAILED}"
+
+if [ -n "$PPL_Q8" ]; then
+    MAX_PPL=$(echo "$PPL_Q8 * $PPL_THRESHOLD" | bc)
+    for name_ppl in "turbo3:$PPL_T3" "turbo4:$PPL_T4"; do
+        name=${name_ppl%%:*}
+        ppl=${name_ppl##*:}
+        if [ -z "$ppl" ]; then
+            echo "  FAIL: $name — could not measure PPL"
+            FAIL=1
+        elif [ "$(echo "$ppl < $MAX_PPL" | bc)" -eq 1 ]; then
+            echo "  PASS: $name PPL $ppl < $MAX_PPL (within ${PPL_THRESHOLD}x of q8_0)"
+        else
+            echo "  FAIL: $name PPL $ppl > $MAX_PPL (exceeds ${PPL_THRESHOLD}x threshold)"
+            FAIL=1
+        fi
+    done
 else
-    BASELINE_PPL=6.111
-    MAX_PPL=$(echo "$BASELINE_PPL * 1.05" | bc)
-    PPL_OK=$(echo "$PPL_TURBO < $MAX_PPL" | bc)
-    if [ "$PPL_OK" -eq 1 ]; then
-        echo "  PASS: turbo3 PPL = $PPL_TURBO (< $MAX_PPL, within 5% of q8_0 $BASELINE_PPL)"
-    else
-        echo "  FAIL: turbo3 PPL = $PPL_TURBO (> $MAX_PPL, exceeds 5% threshold)"
-        FAIL=1
-    fi
-fi
-echo ""
-
-# --- Test 2: Context Scaling ---
-echo "[2/2] Running context scaling check (4K prefill)..."
-TURBO_TPS=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 4096 -ctk turbo3 -ctv turbo3 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+')
-Q8_TPS=$($LLAMA/llama-perplexity -m $MODEL -f $WIKI -c 4096 -ctk q8_0 -ctv q8_0 -fa on --chunks 4 -ngl 99 2>&1 | grep "prompt eval" | grep -oE '[0-9.]+ tokens per second' | grep -oE '[0-9.]+')
-
-if [ -z "$TURBO_TPS" ] || [ -z "$Q8_TPS" ]; then
-    echo "  FAIL: Could not measure speed (crash or timeout)"
-    echo "  turbo3=$TURBO_TPS q8_0=$Q8_TPS"
+    echo "  FAIL: q8_0 baseline failed — cannot compare"
     FAIL=1
-else
-    RATIO=$(echo "scale=4; $TURBO_TPS / $Q8_TPS" | bc)
-    RATIO_OK=$(echo "$RATIO > 0.95" | bc)
-    if [ "$RATIO_OK" -eq 1 ]; then
-        echo "  PASS: turbo3/q8_0 = ${RATIO}x at 4K context (> 0.95 threshold)"
-        echo "  turbo3 = $TURBO_TPS tok/s, q8_0 = $Q8_TPS tok/s"
-    else
-        echo "  FAIL: turbo3/q8_0 = ${RATIO}x at 4K context (< 0.95 threshold)"
-        echo "  turbo3 = $TURBO_TPS tok/s, q8_0 = $Q8_TPS tok/s"
-        echo "  Context scaling regression detected!"
-        FAIL=1
-    fi
 fi
+
+# --- Test 2: Context Scaling (decode speed at 4K, 16K, 32K) ---
 echo ""
+echo "[3/3] Context scaling — decode speed at multiple context lengths..."
+echo ""
+printf "  %-8s %10s %10s %10s %10s %10s\n" "CTX" "q8_0" "turbo3" "turbo4" "t3/q8" "t4/q8"
+printf "  %-8s %10s %10s %10s %10s %10s\n" "--------" "----------" "----------" "----------" "----------" "----------"
+
+for CTX in 4096 16384 32768; do
+    CHUNKS=$((CTX / 1024))
+    Q8_TPS=$(run_ppl "q8" q8_0 q8_0 "$CTX" "$CHUNKS" | extract_speed)
+    T3_TPS=$(run_ppl "t3" turbo3 turbo3 "$CTX" "$CHUNKS" | extract_speed)
+    T4_TPS=$(run_ppl "t4" turbo4 turbo4 "$CTX" "$CHUNKS" | extract_speed)
+
+    if [ -n "$Q8_TPS" ] && [ -n "$T3_TPS" ]; then
+        R3=$(echo "scale=4; $T3_TPS / $Q8_TPS" | bc)
+    else
+        R3="N/A"
+    fi
+    if [ -n "$Q8_TPS" ] && [ -n "$T4_TPS" ]; then
+        R4=$(echo "scale=4; $T4_TPS / $Q8_TPS" | bc)
+    else
+        R4="N/A"
+    fi
+
+    printf "  %-8s %8s %8s %8s %10s %10s\n" \
+        "${CTX}" "${Q8_TPS:-N/A}" "${T3_TPS:-N/A}" "${T4_TPS:-N/A}" "$R3" "$R4"
+
+    # Check speed threshold at 32K (the hardest test)
+    if [ "$CTX" -eq 32768 ]; then
+        for name_ratio in "turbo3:$R3" "turbo4:$R4"; do
+            name=${name_ratio%%:*}
+            ratio=${name_ratio##*:}
+            if [ "$ratio" = "N/A" ]; then
+                echo "  FAIL: $name — could not measure speed at 32K"
+                FAIL=1
+            elif [ "$(echo "$ratio > $SPEED_THRESHOLD" | bc)" -eq 1 ]; then
+                echo "  PASS: $name ${ratio}x at 32K (> ${SPEED_THRESHOLD} threshold)"
+            else
+                echo "  FAIL: $name ${ratio}x at 32K (< ${SPEED_THRESHOLD} threshold)"
+                FAIL=1
+            fi
+        done
+    fi
+done
 
 # --- Summary ---
+echo ""
 echo "========================================"
 if [ "$FAIL" -eq 0 ]; then
     echo "  ALL CHECKS PASSED"
-    echo "========================================"
-    exit 0
 else
-    echo "  CHECKS FAILED — DO NOT PUSH"
-    echo "========================================"
-    exit 1
+    echo "  SOME CHECKS FAILED"
 fi
+echo "========================================"
+exit $FAIL

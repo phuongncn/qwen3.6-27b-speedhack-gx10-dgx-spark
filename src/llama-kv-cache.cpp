@@ -137,7 +137,12 @@ llama_kv_cache::llama_kv_cache(
 
         // Layer-adaptive: use higher precision for quality-sensitive layers
         // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (default), 1 = q8_0 for first+last 4, 2 = q8_0 for last 8
+        //   0 = uniform (default)
+        //   1 = q8_0 for first 4 + last 4
+        //   2 = q8_0 for last 8
+        //   3 = q8_0 for last 4 only
+        //   4 = q8_0 for first 4 only
+        //   5 = q8_0 for first 2 + last 2
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -152,16 +157,19 @@ llama_kv_cache::llama_kv_cache(
             }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
             const uint32_t n_layer = hparams.n_layer;
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
-                if (il < 4 || il >= n_layer - 4) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
+            bool promote = false;
+            if (is_turbo && n_layer >= 8) {
+                switch (adaptive_mode) {
+                    case 1: promote = (il < 4 || il >= n_layer - 4); break;
+                    case 2: promote = (il >= n_layer - 8); break;
+                    case 3: promote = (il >= n_layer - 4); break;
+                    case 4: promote = (il < 4); break;
+                    case 5: promote = (il < 2 || il >= n_layer - 2); break;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
-                if (il >= n_layer - 8) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
+            }
+            if (promote) {
+                layer_type_k = GGML_TYPE_Q8_0;
+                layer_type_v = GGML_TYPE_Q8_0;
             }
         }
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
