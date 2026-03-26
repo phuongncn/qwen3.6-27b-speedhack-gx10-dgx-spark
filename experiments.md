@@ -191,6 +191,27 @@ Prefill pp4096 (tok/s):
 **What**: Decompose `exp(-x) = LUT(-x_int) * polynomial(-x_dec)`, polynomial runs on tensor cores in FP16. Independent of KV quant type.
 **Difficulty**: Medium (1 week). 5-15% improvement, orthogonal to everything else.
 
+### 25b. Sign+magnitude encoding for turbo3 dequant
+**Status**: done — **NEUTRAL** (no measurable speedup)
+**Type**: speed (decode)
+**Branch**: `experiment/sign-magnitude-encoding`
+**What**: Remap turbo3's 3-bit index from {low2, high1} → {mag_idx, sign_bit}. Dequant uses 4-entry magnitude LUT + conditional negate instead of 8-entry centroid LUT. Halves register LUT pressure.
+**Results**:
+  - PPL: 5.8501 (identical to baseline with MMA prefill)
+  - Decode 4K: 30.05 tok/s (baseline ~30.04 = no change)
+  - Decode 32K: 29.91 tok/s (baseline ~29.83 = +0.3%, within noise)
+**Finding**: The decode bottleneck is memory bandwidth, not ALU/register pressure from the LUT. Halving the LUT size saves ~1 instruction per element but has no measurable impact. q8_0 is 31.03 tok/s; the 3% turbo3 gap is structural.
+
+### 25c. Long-context PPL comparison (turbo3 vs q8_0 at 4K/8K)
+**Status**: done — **quality holds at long context**
+**Type**: quality validation
+**Results** (all 2K/8chunks unless noted):
+  - 2K: turbo3 LA-1 5.7690 (-1.17%) vs q8_0 5.8375
+  - 4K/4chunks: turbo3 LA-1 6.3198 (+0.83%) vs q8_0 6.2677 (turbo3 slightly worse)
+  - 8K/4chunks: turbo3 LA-1 7.3952 (-0.39%) vs q8_0 7.4241 (turbo3 wins again)
+  - 8K/4chunks: turbo3 uniform 7.3783 (-0.62%) vs q8_0 7.4241
+**Finding**: Quality advantage is noisy across context lengths. turbo3 generally competitive with q8_0 (±0.5%). The PPL increase at longer eval is due to wikitext data (later text harder), not degradation. Error bars (±0.16-0.18) are larger than the differences.
+
 ---
 
 ## Needs Research — Quality Improvements
@@ -245,13 +266,18 @@ Prefill pp4096 (tok/s):
 **Difficulty**: High (2-3 weeks). Meaningful quality gain at same compression.
 
 ### 25. Drop QJL entirely (turbo3-only approach)
-**Status**: needs-research — **validated by TheTom** (QJL unnecessary, PPL matched, faster/simpler)
+**Status**: done — **QJL HELPS, do NOT drop**
 **Type**: simplification + speed
 **Source**: TheTom's `turboquant_plus` (220 stars) + direct confirmation from Tom
+**Branch**: `experiment/drop-qjl`
 **What**: turbo4 uses 3-bit codebook + 1-bit QJL signs. Tom validated that dropping QJL and giving all bits to the codebook (4-bit Lloyd-Max, no QJL) is faster and equivalent quality. Block size 32 beats 128 for FA parallelism.
-**How it applies**: Would create a new type (turbo4_noqjl?) with 4-bit codebook indices, block size 32, no QJL overhead. Simpler dequant (just codebook lookup + norm multiply, no sign correction).
-**Difficulty**: Medium (1-2 weeks). Could replace turbo4 if benchmarks confirm.
-**Note**: Our turbo4 with norm correction currently *beats* q8_0 PPL. Need to check if dropping QJL + norm correction still beats it, or if QJL+correction is what's giving us that edge.
+**Results** (turbo4 uniform, Qwen3.5-27B):
+  - turbo4 WITH QJL: PPL 5.8186 (-0.32% vs q8_0), prefill 588 tok/s (vec only), decode 29.43
+  - turbo4 NO QJL: PPL 5.8501 (+0.22% vs q8_0), prefill 1124 tok/s (MMA works!), decode 29.40
+  - turbo3 (reference): PPL 5.8323 (-0.09% vs q8_0), prefill 1125 tok/s, decode 29.93
+**Finding**: QJL contributes +0.3 PPL points to turbo4. Without QJL, turbo4 is slightly WORSE than turbo3 in quality (5.8501 vs 5.8323) and decode speed (29.40 vs 29.93), with worse compression (4.25 vs 3.5 bits/element). TheTom's finding may not apply when norm correction is in use — QJL + norm correction is what gives turbo4 its q8_0-beating quality.
+**Benefit**: Dropping QJL DOES fix the fp16 prefill issue (1124 tok/s), but turbo3 already gets 1125 tok/s. No practical advantage over turbo3.
+**Conclusion**: Keep QJL. turbo4's value proposition IS the QJL correction + norm correction combo. Without QJL, just use turbo3.
 
 ---
 

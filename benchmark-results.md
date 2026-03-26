@@ -173,3 +173,31 @@ Note: q8_0 would need ~28+ GiB at 65K — would OOM on 24GB RTX 3090.
 - 99.6% prefill speed, 97.5% decode speed
 - 3.5x KV cache compression
 - Enables 128K context on 24GB GPU where q8_0 OOMs at ~65K
+
+## Experiment: Drop QJL from turbo4 (branch: experiment/drop-qjl)
+
+| Config | PPL | vs q8_0 | pp4096 tok/s | tg64 tok/s | Compression |
+|--------|-----|---------|-------------|-----------|-------------|
+| turbo4 WITH QJL (baseline) | 5.8186 | -0.32% | 588 (vec) | 29.43 | 4.25 bits |
+| turbo4 NO QJL | 5.8501 | +0.22% | 1124 (MMA!) | 29.40 | 4.25 bits* |
+| turbo3 (reference) | 5.8323 | -0.09% | 1125 (MMA) | 29.93 | 3.5 bits |
+
+*Block layout unchanged (rnorm+signs still present but zeroed). True format redesign would be 3.125 bits.
+
+**Key finding**: QJL is worth +0.3 PPL points for turbo4. Without QJL, turbo4 is slightly WORSE than turbo3 in quality, speed, and compression. QJL + norm correction is the reason turbo4 beats q8_0. Dropping QJL does fix the fp16 prefill issue (MMA works = 1124 tok/s), but turbo3 already gets the same prefill speed.
+
+**Conclusion**: Keep QJL. turbo4's value is the QJL+norm-correction combo. TheTom's "QJL unnecessary" finding may not apply when norm correction is present.
+
+## Long-Context PPL Comparison (turbo3 vs q8_0)
+
+| Context | Chunks | q8_0 PPL | turbo3 uniform PPL | turbo3 LA-1 PPL | LA-1 vs q8_0 |
+|---------|--------|----------|-------------------|----------------|-------------|
+| 2K | 8 | 5.8375 | 5.8323 (-0.09%) | 5.7690 (-1.17%) | **turbo3 wins** |
+| 4K | 4 | 6.2677 | 6.3252 (+0.92%) | 6.3198 (+0.83%) | q8_0 wins |
+| 8K | 4 | 7.4241 | 7.3783 (-0.62%) | 7.3952 (-0.39%) | **turbo3 wins** |
+
+**Key finding**: Quality comparison is noisy across context lengths. Error bars ±0.16-0.18 are larger than the measured differences (0.03-0.09 PPL). turbo3 generally competitive with q8_0 at all context lengths. The PPL increase from 2K→8K is a data effect (wikitext text becomes harder to predict), not a quantization degradation — both turbo3 and q8_0 show the same pattern.
+
+## Sign+Magnitude Encoding (branch: experiment/sign-magnitude-encoding)
+
+turbo3 decode speed: 30.05 tok/s (4K) / 29.91 tok/s (32K). Identical to baseline. q8_0: 31.03 tok/s. The 3% gap is memory-bound, not ALU-bound. Encoding change has no effect.
