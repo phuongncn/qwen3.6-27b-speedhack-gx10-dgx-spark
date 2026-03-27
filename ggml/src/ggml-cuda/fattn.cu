@@ -704,11 +704,59 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // Prefill path: Q rotation handled inside, V un-rotation at graph level
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
-        // Pre-rotate Q for turbo decode (moves FWHT out of the vec kernel inner path)
+        cudaStream_t stream = ctx.stream();
+
+        // Dequant turbo3 K/V to fp16 for decode: trades extra memory bandwidth for
+        // simpler inner loop (no bit extract + LUT). Eliminates context scaling on MoE,
+        // zero cost on dense models. Set GGML_TURBO_DECODE_NATIVE=1 to disable.
+        static const bool turbo_decode_native = (getenv("GGML_TURBO_DECODE_NATIVE") != nullptr);
+        const bool do_decode_dequant = !turbo_decode_native && turbo_kv;
+
+        half * k_fp16_dec = nullptr;
+        half * v_fp16_dec = nullptr;
+        ggml_tensor K_f16_dec, V_f16_dec;
+        ggml_tensor * orig_k_decode = nullptr;
+        ggml_tensor * orig_v_decode = nullptr;
+
+        if (do_decode_dequant) {
+            if (K->type == GGML_TYPE_TURBO3_0) {
+                const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+                CUDA_CHECK(cudaMallocAsync(&k_fp16_dec, k_size, stream));
+                dim3 grid_k(K->ne[1], K->ne[2]);
+                k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                    (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->nb[1], K->nb[2]);
+                K_f16_dec = *K;
+                K_f16_dec.type = GGML_TYPE_F16;
+                K_f16_dec.data = k_fp16_dec;
+                K_f16_dec.nb[0] = sizeof(half);
+                K_f16_dec.nb[1] = K->ne[0] * sizeof(half);
+                K_f16_dec.nb[2] = K->ne[0] * K->ne[1] * sizeof(half);
+                K_f16_dec.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+                orig_k_decode = dst->src[1];
+                dst->src[1] = &K_f16_dec;
+            }
+            if (V->type == GGML_TYPE_TURBO3_0) {
+                const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+                CUDA_CHECK(cudaMallocAsync(&v_fp16_dec, v_size, stream));
+                dim3 grid_v(V->ne[1], V->ne[2]);
+                k_turbo3_dequant_f16<<<grid_v, V->ne[0], 0, stream>>>(
+                    (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->nb[1], V->nb[2]);
+                V_f16_dec = *V;
+                V_f16_dec.type = GGML_TYPE_F16;
+                V_f16_dec.data = v_fp16_dec;
+                V_f16_dec.nb[0] = sizeof(half);
+                V_f16_dec.nb[1] = V->ne[0] * sizeof(half);
+                V_f16_dec.nb[2] = V->ne[0] * V->ne[1] * sizeof(half);
+                V_f16_dec.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+                orig_v_decode = dst->src[2];
+                dst->src[2] = &V_f16_dec;
+            }
+        }
+
+        // Pre-rotate Q for turbo (K/V stored in rotated space, whether turbo3 or dequanted fp16)
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         if (turbo_kv && Q->ne[0] % 128 == 0) {
-            cudaStream_t stream = ctx.stream();
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size) {
                 if (q_rot_buf) CUDA_CHECK(cudaFree(q_rot_buf));
@@ -741,9 +789,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 break;
         }
 
-        if (orig_q_decode) {
-            dst->src[0] = orig_q_decode;
-        }
+        if (orig_q_decode) dst->src[0] = orig_q_decode;
+        if (orig_k_decode) dst->src[1] = orig_k_decode;
+        if (orig_v_decode) dst->src[2] = orig_v_decode;
+        if (k_fp16_dec) CUDA_CHECK(cudaFreeAsync(k_fp16_dec, stream));
+        if (v_fp16_dec) CUDA_CHECK(cudaFreeAsync(v_fp16_dec, stream));
     }
 
     // Output inverse rotation for turbo V types is handled at graph level

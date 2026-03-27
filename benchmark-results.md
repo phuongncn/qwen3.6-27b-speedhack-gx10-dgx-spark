@@ -233,3 +233,66 @@ turbo3 decode speed: 30.05 tok/s (4K) / 29.91 tok/s (32K). Identical to baseline
 - Up to 65K: Use LA-1 turbo3 (best PPL: -1.17%)
 - 65K-128K: Use LA-5 turbo3 (best balance: -0.49% PPL, 4.2x compression)
 - 128K+: Use turbo3 uniform (maximum compression: 4.9x)
+
+## Experiment: Vec Q Pre-rotation (experiment/vec-q-prerotate)
+
+Moves FWHT Q rotation from inside the vec kernel (22 syncthreads for D=256) to a separate
+kernel launch before vec kernel dispatch. Reduces register pressure and eliminates barrier stalls.
+
+### MoE Model: Qwen3.5-35B-A3B-Q4_K_S (19.24 GiB)
+
+| Context | KV Type | Before | After | Change |
+|---------|---------|--------|-------|--------|
+| p=0 | turbo3 | 118.10 | 125.77 | **+6.5%** |
+| p=0 | q8_0 | — | 138.01 | (turbo3=91.1% of q8_0) |
+| p=8K | turbo3 | — | 114.44 | — |
+
+### Dense Model: Qwen3.5-27B-Q6_K (20.56 GiB)
+
+| Context | KV Type | Before | After | Change |
+|---------|---------|--------|-------|--------|
+| p=0 | turbo3 | 30.05 | 30.13 | no regression |
+| p=8K | turbo3 | — | 30.03 | — |
+| p=32K | turbo3 | — | 29.94 | — |
+| p=42K | turbo3 | — | 29.95 | — |
+| p=32K | q8_0 | — | 30.99 | (turbo3=96.6%) |
+| p=42K | q8_0 | — | 30.99 | (turbo3=96.6%) |
+
+### Community Report (different GPU, Qwen3.5-27B-Q8_0, 42K context)
+
+| KV Type | Prefill | Decode |
+|---------|---------|--------|
+| q8_0 | 2492.44 | 23.96 |
+| turbo3 | 2445.92 | 16.30 (68% of q8_0) |
+
+Note: regression is worse on the tester's GPU (likely lower bandwidth) where FFN is slower
+and attention is a larger fraction of total compute. On our RTX 3090, turbo3 holds at 96.6% of q8_0.
+
+PPL verification: 19.7152 (identical to baseline — FWHT is linear, so in-kernel vs pre-kernel produces same result).
+
+## Experiment: Decode Dequant to FP16 (experiment/turbo-decode-fp16)
+
+Dequant turbo3 K/V to fp16 before vec kernel for decode, so the inner loop uses
+simple fp16 dot product instead of turbo3 bit-extract+LUT. Gated by GGML_TURBO_DECODE_FP16=1.
+
+### MoE Model: Qwen3.5-35B-A3B-Q4_K_S
+
+| Context | No flag | With flag | q8_0 | vs q8_0 |
+|---------|---------|-----------|------|---------|
+| p=0 | 125.77 | 127.98 | 138.01 | 92.7% |
+| p=8K | 114.44 | **127.37** | — | — |
+| p=32K | — | **126.92** | — | — |
+
+### Dense Model: Qwen3.5-27B-Q6_K
+
+| Context | No flag | With flag | q8_0 | vs q8_0 |
+|---------|---------|-----------|------|---------|
+| p=0 | 30.13 | 30.29 | 31.0 | 97.7% |
+| p=32K | 29.94 | 30.05 | 30.99 | 97.0% |
+| p=42K | 29.95 | 30.06 | 30.99 | 97.0% |
+
+PPL verification: 19.7152 (bit-exact match — turbo3 centroids are lossless in fp16)
+
+**Key finding**: FP16 dequant eliminates context scaling degradation on MoE models
+(127 t/s flat from p=0 to p=32K) and has ZERO cost on dense models at all context lengths.
+Could be made the default for turbo3 decode.
