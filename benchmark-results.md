@@ -1805,3 +1805,19 @@ Comparison vs competitors at alpha=1.20:
 Note: our numbers use 50iter_finetuned (3-bit) and 100iter (2-bit) codebooks.
 Compiled-in numpy codebook may be even better (preliminary showed 5.528 @2K vs 5.567).
 **We now CRUSH every competitor at every context length at both bit rates.**
+
+## Experiment #72: Chunked cuBLAS GEMM Prefill (2026-03-31) — REJECTED
+
+**Model**: Qwen3.5-27B-heretic.Q6_K, RTX 3090, `-ctk turbo3_tcq -ctv turbo3`
+**Setup**: Dequant K/V in 4096-token chunks to f16, use `cublasGemmStridedBatchedEx` for Q@K^T and P@V, custom online softmax kernel between.
+
+### Prefill Speed (tok/s)
+
+| Prompt | MMA (baseline) | Chunked cuBLAS | Diff |
+|--------|---------------|----------------|------|
+| pp512  | 1008.09       | 995.30         | -1.3% |
+| pp2048 | 1011.77       | 985.65         | -2.6% |
+| pp4096 | 999.76        | 966.80         | -3.3% |
+| pp8192 | 980.38        | 931.54         | -5.0% |
+
+**Conclusion**: Chunked cuBLAS is uniformly slower, degradation grows with context length. The fused MMA flash attention avoids materializing the O(nq×nkv) score matrix S, saving bandwidth that dominates any tensor core advantage from cuBLAS. Not worth pursuing.

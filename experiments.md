@@ -811,12 +811,12 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Expected**: ~7% decode speedup, reduced VRAM at long context (eliminates O(context) f16 buffer).
 **Note**: This is #66 (fused attention+dequant) but specifically scoped to TCQ decode only.
 
-### 72. Chunked cuBLAS GEMM prefill `ready`
+### 72. Chunked cuBLAS GEMM prefill `rejected`
 **Source**: Competitive analysis speed gap. Duster's implementation: 3-kernel pipeline (init, softmax-update, finalize) + `cublasGemmStridedBatchedEx`.
 **Concept**: Dequant 4096 KV tokens at a time to f16, use cuBLAS for Q@K^T and P@V with online softmax between chunks. NOT TCQ-specific — works for all quant types.
 **Change**: New prefill path in fattn.cu. Reference: Duster's fattn.cu lines 502-1005.
 **Expected**: 20-27% prefill speedup. Enables 350K+ context on single RTX 3090.
-**Note**: Our TCQ dequant per chunk is FASTER than TBQ's (no inverse Hadamard needed).
+**Result**: **1-5% SLOWER than fused MMA.** pp512: -1.3%, pp2048: -2.6%, pp4096: -3.3%, pp8192: -5.0%. The fused MMA flash attention is fundamentally better because it avoids materializing the O(nq×nkv) score matrix S. cuBLAS GEMM must write/read S as intermediate, adding significant memory bandwidth overhead that dominates any tensor core advantage. Also found a bug in Duster's code: `CUBLAS_OP_N` with `lda=D < M=chunk_len` (undefined behavior). Not worth pursuing further — the architecture is fundamentally disadvantaged vs fused kernels on modern GPUs.
 
 ### 73. Parallelize TCQ encode thread-0 serial sections `ready`
 **Source**: Competitive analysis encode speed. Thread-0 does FWHT rotation + backtracking + bitpacking alone.
@@ -877,10 +877,10 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Store per-layer alpha in constant memory. Use different temperature scaling per layer based on that layer's Q effective rank.
 **Risk**: Requires knowing Q statistics at quantization time (not available in llama.cpp's online KV quantize). Could use precomputed per-model tables.
 
-### 84. 350K+ context validation `planned`
+### 84. 350K+ context validation `blocked`
 **Source**: Duster's chunked cuBLAS GEMM enables 350K+ on single 3090. Currently we OOM much earlier.
 **Concept**: After implementing #72, benchmark at 128K/256K/350K. Verify PPL doesn't degrade, measure speed.
-**Depends**: #72 (chunked cuBLAS GEMM prefill).
+**Depends**: #72 (chunked cuBLAS GEMM prefill) — **REJECTED** (slower). Need alternative approach for long-context VRAM savings.
 
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
