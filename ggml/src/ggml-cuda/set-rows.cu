@@ -61,6 +61,52 @@ static void load_tcq_norm_alpha() {
     }
 }
 
+// TCQ error dump for autocorrelation analysis (TURBO_TCQ_DUMP_ERRORS=N)
+static int    tcq_dump_n = 0;
+static float * tcq_dump_x_host = nullptr;
+static uint8_t * tcq_dump_out_host = nullptr;
+static float * tcq_dump_x_dev = nullptr;
+static uint8_t * tcq_dump_out_dev = nullptr;
+
+static void tcq_error_dump_flush() {
+    if (tcq_dump_n == 0) return;
+    cudaMemcpy(tcq_dump_x_host, tcq_dump_x_dev, tcq_dump_n * 128 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tcq_dump_out_host, tcq_dump_out_dev, tcq_dump_n * 128 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    FILE * f = fopen("/tmp/tcq_errors.bin", "wb");
+    if (f) {
+        int32_t header[1] = { tcq_dump_n };
+        fwrite(header, sizeof(int32_t), 1, f);
+        fwrite(tcq_dump_x_host, sizeof(float), tcq_dump_n * 128, f);
+        fwrite(tcq_dump_out_host, sizeof(uint8_t), tcq_dump_n * 128, f);
+        fclose(f);
+        fprintf(stderr, "TCQ: dumped %d groups to /tmp/tcq_errors.bin\n", tcq_dump_n);
+    }
+    cudaFree(tcq_dump_x_dev);
+    cudaFree(tcq_dump_out_dev);
+    free(tcq_dump_x_host);
+    free(tcq_dump_out_host);
+}
+
+static void init_tcq_error_dump() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const char *s = getenv("TURBO_TCQ_DUMP_ERRORS");
+    if (!s) return;
+    int n = atoi(s);
+    if (n <= 0 || n > 100000) return;
+    tcq_dump_n = n;
+    tcq_dump_x_host = (float *)malloc(n * 128 * sizeof(float));
+    tcq_dump_out_host = (uint8_t *)malloc(n * 128 * sizeof(uint8_t));
+    cudaMalloc(&tcq_dump_x_dev, n * 128 * sizeof(float));
+    cudaMalloc(&tcq_dump_out_dev, n * 128 * sizeof(uint8_t));
+    cudaMemcpyToSymbol(d_tcq_dump_x_buf, &tcq_dump_x_dev, sizeof(float*));
+    cudaMemcpyToSymbol(d_tcq_dump_out_buf, &tcq_dump_out_dev, sizeof(uint8_t*));
+    cudaMemcpyToSymbol(d_tcq_dump_max, &n, sizeof(int));
+    atexit(tcq_error_dump_flush);
+    fprintf(stderr, "TCQ: will dump errors for first %d groups to /tmp/tcq_errors.bin\n", n);
+}
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -433,6 +479,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
             }
             load_tcq_norm_alpha();
+            init_tcq_error_dump();
         }
         // TCQ Viterbi encode: 512 threads per block (one per trellis state)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
@@ -471,6 +518,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 }
             }
             load_tcq_norm_alpha();
+            init_tcq_error_dump();
         }
         // 2-bit TCQ Viterbi encode: 256 threads per block (one per trellis state, L=8)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);

@@ -824,7 +824,7 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Change**: turbo-quant-cuda.cuh TCQ encode kernel.
 **Result**: **+12.6% prefill speedup** (3-bit: 902→1019, 2-bit: 983→1102 t/s at pp512). Warp-level reductions added in simplify pass. Merged to master.
 
-### 74. TCQ error decorrelation via element permutation `needs-research`
+### 74. TCQ error decorrelation via element permutation `dropped`
 **Source**: Competitive analysis quality findings. TCQ trellis (right-shift, k=3) shares 6/9 state bits between consecutive positions → correlated errors. Autocorrelation ~0.15-0.30 at lag 1. Correlated errors average out slower in Q@K dot products.
 **Concept**: Apply fixed permutation (e.g., bit-reversal) to element indices after FWHT before trellis encoding. Decorrelates errors across d_k dimension without changing MSE. Matching inverse permutation in decode.
 **Risk**: Medium — needs careful verification that permuted trellis still converges. May interact with codebook optimality.
@@ -845,11 +845,10 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Temperature scaling (hypothesis b) was the answer. Added `d_turbo4_alpha` constant with `TURBO4_ALPHA` env var override.
 **Result**: α=1.2 optimal (same as symmetric TCQ). PPL improvement: −0.236 (2K), −0.637 (8K), −0.482 (32K). turbo4 now BEATS q8_0 at all context lengths. V matters more than K (same as TCQ). Hardcoded α=1.2 as default.
 
-### 78. Measure TCQ error autocorrelation empirically `ready`
+### 78. Measure TCQ error autocorrelation empirically `done`
 **Source**: Finding #29 from competitive analysis. Theoretical prediction of lag-1 autocorrelation ~0.15-0.30 but never measured.
-**Concept**: Dump quantization errors from TCQ encode, compute autocorrelation at lags 1-10. Compare with scalar Lloyd-Max (should be ~0). Confirm the theoretical prediction.
-**Change**: Add dump mode to encode kernel (env var trigger), Python analysis script.
-**Test**: Correlate measured autocorrelation with PPL degradation at long context.
+**Concept**: Dumped post-FWHT values and output symbols from kernel. Computed errors and autocorrelation in Python.
+**Result**: Theoretical prediction was WRONG. Both 3-bit and 2-bit TCQ errors are effectively iid (lag-1 autocorrelation ≈ -0.008, matching iid baseline exactly). FWHT rotation destroys trellis error structure. Experiment #74 can be dropped.
 
 ### 79. TBQ-style encode as TCQ fallback for speed-critical path `needs-research`
 **Source**: Duster's TBQ encode is fully parallel (one binary search per element, ~660B shared mem) vs our Viterbi (128 sequential barrier-synced iterations, 34.5KB shared mem).

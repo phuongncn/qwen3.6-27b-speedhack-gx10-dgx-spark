@@ -19,6 +19,11 @@ static __device__ int   d_innerq_is_k;                   // 1 = current set_rows
 extern void turbo_innerq_update_fattn_scales(const float * scale_inv);
 extern void turbo_innerq_init_fattn();
 
+// TCQ error dump: save post-FWHT normalized values and output symbols for autocorrelation analysis
+static __device__ float   * d_tcq_dump_x_buf   = nullptr; // [max_groups][128] original values
+static __device__ uint8_t * d_tcq_dump_out_buf  = nullptr; // [max_groups][128] output symbols
+static __device__ int       d_tcq_dump_max      = 0;       // max groups to dump (0 = disabled)
+
 // === Post-FWHT data extraction for empirical codebook computation ===
 // Enabled by TURBO_EXTRACT=<max_samples> env var (e.g. TURBO_EXTRACT=2000000)
 // Dumps post-rotation normalized values to /tmp/turbo_postrot.bin (float32)
@@ -794,6 +799,10 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     }
     __syncthreads();
 
+    // Save x[] to global buffer before backtrack overwrites it
+    if (d_tcq_dump_max > 0 && group < d_tcq_dump_max && sid < 128)
+        d_tcq_dump_x_buf[group * 128 + sid] = x[sid];
+
     // Backtrack (inherently sequential)
     uint8_t * outputs = (uint8_t *)x;
     if (sid == 0) {
@@ -806,6 +815,10 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         shared_initial_state = state;
     }
     __syncthreads();
+
+    // Save output symbols to global buffer
+    if (d_tcq_dump_max > 0 && group < d_tcq_dump_max && sid < 128)
+        d_tcq_dump_out_buf[group * 128 + sid] = outputs[sid];
 
     // Parallel recon norm: t>=2 can compute state directly from 3 outputs (3 shifts of 3 = 9 bits)
     float my_recon_sq = 0.0f;
@@ -1091,6 +1104,10 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     }
     __syncthreads();
 
+    // Save x[] to global buffer before backtrack overwrites it
+    if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
+        d_tcq_dump_x_buf[grp * 128 + sid] = x[sid];
+
     // Backtrack (inherently sequential)
     uint8_t * outputs = (uint8_t *)x;
     if (sid == 0) {
@@ -1103,6 +1120,10 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         shared_initial_state = state;
     }
     __syncthreads();
+
+    // Save output symbols to global buffer
+    if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
+        d_tcq_dump_out_buf[grp * 128 + sid] = outputs[sid];
 
     // Parallel recon norm: t>=3 can compute state directly from 4 outputs (4 shifts of 2 = 8 bits)
     float my_recon_sq = 0.0f;

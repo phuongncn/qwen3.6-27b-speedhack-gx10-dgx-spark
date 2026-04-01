@@ -2004,3 +2004,40 @@ V matters more, but K contributes meaningfully at longer context (0.128 PPL at 8
 ### Conclusion
 turbo4 α=1.2 BEATS q8_0 at all context lengths. 4-bit quant outperforming 8-bit.
 Temperature scaling Δ: −0.236 (2K), −0.637 (8K), −0.482 (32K). Hardcoded α=1.2 as default.
+
+---
+
+## Experiment #78: TCQ Error Autocorrelation Measurement
+Date: 2026-04-01, Branch: experiment/78-tcq-error-autocorrelation
+
+### Method
+Dumped post-FWHT normalized values and output symbols from TCQ Viterbi encode kernel
+(TURBO_TCQ_DUMP_ERRORS=1000). Reconstructed quantization errors in Python. Computed
+autocorrelation at lags 0-10, averaged over 1000 groups.
+
+### 3-bit TCQ (512 states)
+
+| Lag | Autocorrelation |
+|-----|----------------|
+| 0 | +1.0000 |
+| 1 | -0.0073 |
+| 2 | -0.0153 |
+| 3 | -0.0089 |
+
+iid baseline: -0.0080. Per-group lag-1: mean -0.0073, std 0.087.
+
+### 2-bit TCQ (256 states)
+
+| Lag | Autocorrelation |
+|-----|----------------|
+| 0 | +1.0000 |
+| 1 | -0.0080 |
+| 2 | -0.0067 |
+| 3 | -0.0102 |
+
+iid baseline: -0.0081. Per-group lag-1: mean -0.0080, std 0.093.
+
+### Conclusion
+**Theoretical prediction of lag-1 ≈ 0.15-0.30 was WRONG.** TCQ errors are effectively iid
+(zero autocorrelation at all lags). FWHT rotation destroys trellis-induced error structure.
+Experiment #74 (error decorrelation via permutation) can be dropped — nothing to fix.
