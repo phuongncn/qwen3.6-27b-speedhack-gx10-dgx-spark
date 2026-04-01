@@ -804,12 +804,12 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Change**: Conditional in encode kernel based on `iq_is_k` flag (already available in set-rows.cu).
 **Test**: PPL at 2K/8K/32K/64K. Compare with symmetric alpha scaling (#69).
 
-### 71. Native `vec_dot_fattn_vec_KQ_turbo3_tcq` — inline TCQ decode in FA `ready`
+### 71. Native `vec_dot_fattn_vec_KQ_turbo3_tcq` — inline TCQ decode in FA `rejected`
 **Source**: Competitive analysis speed gap. Duster has `vec_dot_fattn_vec_KQ_tbq3_0` for TBQ. We dequant all KV to f16 first.
 **Concept**: Read 9-bit state from bitstream → `codebook[state] * norm` → accumulate dot product inline in FA. No intermediate f16 buffer needed.
 **Change**: New function in fattn-common.cuh. Simpler than TBQ's vec_dot (no inverse Hadamard).
 **Expected**: ~7% decode speedup, reduced VRAM at long context (eliminates O(context) f16 buffer).
-**Note**: This is #66 (fused attention+dequant) but specifically scoped to TCQ decode only.
+**Result**: **0% improvement** on both dense Qwen3.5-27B and MoE Qwen3.5-35B-A3B. The dequant-to-f16 path is already fast enough that eliminating the intermediate buffer doesn't help — the bottleneck is elsewhere.
 
 ### 72. Chunked cuBLAS GEMM prefill `rejected`
 **Source**: Competitive analysis speed gap. Duster's implementation: 3-kernel pipeline (init, softmax-update, finalize) + `cublasGemmStridedBatchedEx`.
@@ -861,11 +861,11 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Status**: Code changes done, needs final build+test verification.
 **Test**: Verify PPL on a head_dim=128 model (e.g., Llama-3) and head_dim=256 model (Qwen3.5).
 
-### 81. Sparse V dequant integration with TCQ `ready`
+### 81. Sparse V dequant integration with TCQ `done`
 **Source**: #65 planned but not tested with TCQ path. TheTom showed +22.8% decode at 32K.
 **Concept**: Skip V dequant+accumulation when all attention weights in a block < threshold. Works with both f16-dequant path and future native vec_dot (#71).
 **Change**: ~3 lines in fattn-vec.cuh. Purely additive.
-**Expected**: +22.8% decode at 32K, more at longer context. Zero quality impact.
+**Result**: Already implemented in commit 78d6bb5a0. Active for all quant types in fattn-vec decode path. Not yet benchmarked independently for TCQ.
 
 ### 82. Replicate TBQ's exact 1-bit behavior for validation `needs-research`
 **Source**: Bombshell finding — TBQ is accidentally 1-bit. 100% of post-FWHT values map to 2 inner bins.
