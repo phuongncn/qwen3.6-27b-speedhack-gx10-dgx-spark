@@ -835,10 +835,10 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Use Lloyd-Max bin boundaries to inform TCQ Viterbi initial state distribution or trellis path metric initialization. The optimal scalar quantizer boundaries partition the space in a way that might help Viterbi converge faster or to better paths.
 **Risk**: Speculative — trellis structure already constrains state transitions heavily.
 
-### 76. Optimal temperature grid search across context lengths `ready`
-**Source**: Follow-up to #69. TBQ4=6.909, TBQ3=7.034, TBQ2=7.332 are monotonically ordered by temperature severity, suggesting optimal alpha varies with bit-rate.
-**Concept**: Sweep alpha from 1.0 to 3.0 in 0.25 steps for turbo2_tcq, turbo3_tcq, and turbo4. Measure PPL at 2K/8K/32K/64K for each. Find Pareto-optimal alpha per bit-rate.
-**Test**: 4 alphas × 3 quant types × 4 contexts = 48 benchmark runs. ~2 hrs on server.
+### 76. Optimal temperature grid search across context lengths `done`
+**Source**: Follow-up to #69/#70. Does optimal αV vary by bit-rate and context length?
+**Concept**: Sweep αV from 1.0 to 1.6 (αK=1.1 fixed) for turbo3_tcq and turbo2_tcq at 2K/8K/32K.
+**Result**: αV=1.3 is robustly optimal for 3-bit at all contexts. 2-bit has slight preference for αV=1.35 at 8K (−0.052 PPL) but regresses at 2K (+0.041). Difference too small for per-bit-rate defaults. **Current defaults confirmed optimal. No changes.**
 
 ### 77. Verify turbo4 quality gap vs TBQ4 `ready`
 **Source**: Competitive analysis: TBQ4 beats turbo4 by 0.01-0.03 PPL everywhere. turbo4 has no TCQ — just scalar 4-bit quantization.

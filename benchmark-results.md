@@ -1918,3 +1918,37 @@ using all 512/256 threads. Backtrack and bitpack remain serial.
 | 28.69 | 29.64 | +3.3% (no regression) |
 
 ### Result: CONFIRMED — ~12% prefill speedup, no quality change
+
+---
+
+## Experiment #76: Temperature Grid Search — αV Sweep per Bit-Rate (2026-04-01)
+
+αK fixed at 1.1 (known near-optimal, 6.5x less impact than V). Sweeping αV across context lengths.
+
+### 3-bit TCQ (turbo3_tcq, 32 chunks except 32K=16 chunks)
+
+| αV | 2K PPL | 8K PPL | 32K PPL |
+|----|--------|--------|---------|
+| 1.00 | 6.4696 | 6.9283 | 7.2949 |
+| 1.15 | 6.3445 | 6.5130 | — |
+| **1.30** | **6.3295** | **6.3472** | **6.6392** |
+| 1.45 | 6.4506 | 6.3782 | 6.6949 |
+| 1.60 | — | 6.5346 | 6.8512 |
+
+**Result**: αV=1.30 is optimal at ALL context lengths for 3-bit. Sharp degradation above 1.3.
+
+### 2-bit TCQ (turbo2_tcq, 32 chunks except 32K=16 chunks)
+
+| αV | 2K PPL | 8K PPL | 32K PPL |
+|----|--------|--------|---------|
+| 1.00 | 6.7193 | 7.2169 | — |
+| **1.30** | **6.4972** | 6.5338 | **6.7930** |
+| 1.35 | 6.5378 | **6.4821** | — |
+| 1.45 | 6.5820 | 6.5064 | 6.7927 |
+| 1.60 | 6.7418 | 6.6431 | 6.9458 |
+
+**Result**: αV=1.30 best at 2K, αV=1.35 best at 8K (−0.052), tied at 32K. Difference too small for per-bit-rate defaults.
+
+### Conclusion
+Current defaults (αK=1.1, αV=1.3) are near-optimal for both bit rates. No changes needed.
+The α=1.0→1.3 gap grows with context (3-bit: 0.14 at 2K → 0.66 at 32K), confirming temperature scaling is essential.
