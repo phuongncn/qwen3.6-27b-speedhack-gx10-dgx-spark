@@ -926,6 +926,22 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Estimated time**: ~17 hours on dorei (long contexts dominate). Could parallelize short contexts to 3090-A/B with fresh builds.
 **Risk**: Low — measurement only, no code changes.
 
+### 88. Native turbo decode vs dequant+MMA `tested-no-improvement`
+**Source**: Duster issue #8 "fused K tile loading" — adapted as native VEC decode instead of MMA+dequant.
+**Concept**: Skip dequant-to-fp16 step during decode, let VEC kernel read turbo3_tcq directly (3/16 bandwidth vs fp16). Hypothesis: bandwidth savings improve long-context decode speed.
+**Implementation**: Added TCQ dispatch entries to VEC kernel (fattn-vec.cuh), fixed FATTN_KQ_STRIDE alignment check that was crashing native turbo decode, moved codebook loading before dequant gate.
+**Result**: Native VEC is 1-1.5% SLOWER than dequant+MMA at all contexts (2K-32K) on Qwen3.5-27B/3090. MMA tensor cores on fp16 beat VEC scalar on turbo bits. FFN compute dominates decode (29.6 vs 31.1 t/s f16 = 4.8% gap), making attention path optimization marginal.
+**Side finding**: Prefill gap vs f16/q8_0 is 10-11% — much larger than decode gap. Main overhead is dequant kernels + Q FWHT rotation, not bandwidth. This is where the real speed opportunity lies.
+**Code fixes**: TCQ VEC dispatch + FATTN_KQ_STRIDE fix are real bug fixes, committed on branch. `GGML_TURBO_DECODE_NATIVE=1` available for bandwidth-limited testing.
+**Branch**: experiment/fused-k-dequant
+
+### 89. Inverse FWHT K dequant for all turbo types `tested-regression`
+**Source**: turbo4 already had inv_fwht (+167% prefill). Hypothesis: extend to turbo3/turbo2/turbo3_tcq/turbo2_tcq to eliminate Q rotation kernel for all types.
+**Implementation**: Wrote 4 new inv_fwht kernels (turbo3/turbo2 with QK=32 norm-before-butterfly, turbo3_tcq/turbo2_tcq with QK=128 norm-factor-out). Updated prefill and decode paths. Conditioned Q rotation on !orig_k_decode.
+**Result**: 0% prefill speed change (FFN dominates, Q rotation is invisible). **KLD regression**: turbo3 +2.3% (0.075→0.077), turbo3_tcq +7.5% (0.055→0.059). Root cause: inv_fwht outputs K in original domain, fp16 truncation loses more precision than in rotated domain (rotated values are more uniform after FWHT+channel scaling). For QK=32 types, per-block norm mixing through butterfly adds further precision loss.
+**Conclusion**: Reverted. The FWHT rotation that makes values more uniform for quantization also makes them more uniform for fp16 representation. Applying inv_fwht before fp16 cast defeats this benefit.
+**Branch**: experiment/fused-k-dequant
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**

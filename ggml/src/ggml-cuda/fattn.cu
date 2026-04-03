@@ -557,11 +557,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
-            // Runtime codebook loading for fattn decode
             {
-                static bool tcq_fattn_cb_loaded = false;
-                if (!tcq_fattn_cb_loaded) {
-                    tcq_fattn_cb_loaded = true;
+                static bool tcq_fattn_k_cb_loaded = false;
+                if (!tcq_fattn_k_cb_loaded) {
+                    tcq_fattn_k_cb_loaded = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB");
                     if (cb_path) {
                         float cb[512];
@@ -569,10 +568,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 512, f) == 512) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
-                            fprintf(stderr, "TCQ decode: loaded codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ K prefill: loaded codebook from %s\n", cb_path);
                         } else {
                             if (f) fclose(f);
-                            fprintf(stderr, "TCQ decode: FAILED to load codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ K prefill: FAILED to load codebook from %s\n", cb_path);
                         }
                     }
                 }
@@ -580,11 +579,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
         } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
-            // Runtime codebook loading for 2-bit fattn decode
             {
-                static bool tcq2_fattn_cb_loaded = false;
-                if (!tcq2_fattn_cb_loaded) {
-                    tcq2_fattn_cb_loaded = true;
+                static bool tcq2_fattn_k_cb_loaded = false;
+                if (!tcq2_fattn_k_cb_loaded) {
+                    tcq2_fattn_k_cb_loaded = true;
                     const char *cb_path = getenv("TURBO_TCQ_CB2");
                     if (cb_path) {
                         float cb[256];
@@ -592,10 +590,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
                         if (f && fread(cb, sizeof(float), 256, f) == 256) {
                             fclose(f);
                             cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
-                            fprintf(stderr, "TCQ2 decode: loaded 2-bit codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ2 K prefill: loaded 2-bit codebook from %s\n", cb_path);
                         } else {
                             if (f) fclose(f);
-                            fprintf(stderr, "TCQ2 decode: FAILED to load codebook from %s\n", cb_path);
+                            fprintf(stderr, "TCQ2 K prefill: FAILED to load codebook from %s\n", cb_path);
                         }
                     }
                 }
@@ -603,7 +601,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], 1.0f);
         } else {
-            // turbo4 K: inverse FWHT dequant — produces K in original domain (no Q rotation needed)
+            // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         }
@@ -699,7 +697,6 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Rotate Q for turbo pre-rotate-queries (only when K is in rotated space)
     // turbo4 K is dequanted via inverse FWHT → original domain, so Q stays unrotated
-    // Uses persistent per-device buffer to avoid cudaMallocAsync issues with graph-level ops
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
     if (turbo_k && K->type != GGML_TYPE_TURBO4_0 && Q->ne[0] % 128 == 0) {
@@ -830,6 +827,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO2_TCQ)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
@@ -848,6 +851,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO2_TCQ)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -957,13 +966,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
 
-    // TurboQuant: only the vec kernel has turbo dequant support.
+    // TurboQuant: only the vec kernel has native turbo dequant support.
+    // No FATTN_KQ_STRIDE alignment needed — vec kernel handles arbitrary lengths.
     if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
         K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
         K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
         K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
-        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)
+        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -1088,7 +1098,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (e) fprintf(stderr, "TURBO_PREFILL_VEC=%s: forcing vec prefill for turbo types\n", e);
         return e != nullptr;
     }();
-    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ ||
+    const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
     if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
@@ -1096,11 +1106,53 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_turbo_prefill_attend(ctx, dst);
     } else {
         load_tcq_decode_alpha();
+
+        // Load runtime codebooks for TCQ types (needed by both dequant and native VEC paths)
+        if (K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ) {
+            static bool tcq3_cb_loaded = false;
+            if (!tcq3_cb_loaded) {
+                tcq3_cb_loaded = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB");
+                if (cb_path) {
+                    float cb[512];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512*sizeof(float));
+                        fprintf(stderr, "TCQ decode: loaded 3-bit codebook from %s\n", cb_path);
+                    } else {
+                        if (f) fclose(f);
+                        fprintf(stderr, "TCQ decode: FAILED to load 3-bit codebook from %s\n", cb_path);
+                    }
+                }
+            }
+        }
+        if (K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
+            static bool tcq2_cb_loaded = false;
+            if (!tcq2_cb_loaded) {
+                tcq2_cb_loaded = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB2");
+                if (cb_path) {
+                    float cb[256];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256*sizeof(float));
+                        fprintf(stderr, "TCQ decode: loaded 2-bit codebook from %s\n", cb_path);
+                    } else {
+                        if (f) fclose(f);
+                        fprintf(stderr, "TCQ decode: FAILED to load 2-bit codebook from %s\n", cb_path);
+                    }
+                }
+            }
+        }
+
         cudaStream_t stream = ctx.stream();
 
-        // Dequant turbo3 K/V to fp16 for decode: trades extra memory bandwidth for
-        // simpler inner loop (no bit extract + LUT). Eliminates context scaling on MoE,
-        // zero cost on dense models. Set GGML_TURBO_DECODE_NATIVE=1 to disable.
+        // Dequant turbo K/V to fp16 for decode: MMA tensor cores on fp16 beat VEC scalar
+        // on turbo bits for dense models. Bandwidth savings from turbo's 3/16 footprint are
+        // negligible relative to FFN compute (~1% slower native on Qwen3.5-27B, 3090).
+        // Set GGML_TURBO_DECODE_NATIVE=1 to force native VEC path (may help bandwidth-limited configs).
         static const bool turbo_decode_native = (getenv("GGML_TURBO_DECODE_NATIVE") != nullptr);
         const bool do_decode_dequant = !turbo_decode_native && turbo_kv;
 
@@ -1122,6 +1174,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     kv_dequant_k_buf_size[device_dec] = k_size;
                 }
                 k_fp16_dec = kv_dequant_k_buf[device_dec];
+                // K dequant to fp16 in rotated domain (Q rotation handles domain matching)
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 if (K->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(

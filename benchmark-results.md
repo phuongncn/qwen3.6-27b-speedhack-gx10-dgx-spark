@@ -4124,3 +4124,82 @@ TURBO_TCQ_DECODE_ALPHA_V env var. Encode alpha auto-disabled. Golden codebook (p
 *Estimated from previous encode sweeps on same GPU. Need verification.
 
 **Decode-time alpha wins at 8K+ contexts.** At 32K, decode α=1.00 (0.040199) may significantly beat encode α=1.04 (0.044708 from competitive benchmarks). The decode curve at long context is remarkably clean — monotonically increasing from α=1.00, no anomalies.
+
+## Experiment #88: Native Decode vs Dequant+MMA (dorei, 2026-04-03)
+
+**Question**: Does skipping the dequant-to-fp16 step and running the VEC kernel directly on turbo3_tcq
+(3/16 bandwidth) improve decode speed?
+
+**Setup**: dorei RTX 3090, Qwen3.5-27B Q6_K, turbo3_tcq K+V, -fa 1, -r 3, tg64
+
+### Decode speed (t/s) at 32K context (tg64 after pp$CTX)
+
+| KV type | pp2048 | pp32768 | tg64@2K | tg64@8K | tg64@16K | tg64@32K |
+|---------|--------|---------|---------|---------|----------|----------|
+| f16 | 1146 | 1001 | - | - | - | 31.06 |
+| q8_0 | 1144 | 993 | - | - | - | 30.64 |
+| turbo3_tcq (dequant+MMA) | 1023 | 888 | 29.67 | 29.62 | 29.57 | 29.57 |
+| turbo3_tcq (native VEC) | 1023 | 888 | 29.23 | 29.25 | 29.31 | 29.34 |
+
+### Analysis
+
+- **Native VEC is 1-1.5% slower than dequant+MMA** across all contexts.
+- MMA tensor cores on fp16 beat VEC scalar math on turbo bits for this dense 27B model.
+- Bandwidth savings (turbo3 = 3/16 of fp16) are negligible: K at 32K is only 12.6 MB,
+  reading time ~0.01ms vs ~34ms total per token. FFN compute dominates.
+- **Prefill gap vs f16/q8_0 is 10-11%** — much larger and more actionable than the 4.8% decode gap.
+  Prefill overhead = dequant kernels + Q rotation (FWHT), not bandwidth.
+
+### Conclusion
+
+**Result: no improvement.** Dequant+MMA remains the faster decode path.
+Native VEC path now works for TCQ types (was previously crashing due to missing dispatch entries
+and overly strict FATTN_KQ_STRIDE alignment check). Fixed as a code bug but not enabled by default.
+`GGML_TURBO_DECODE_NATIVE=1` available for testing on bandwidth-limited configs.
+
+---
+
+## Experiment #89: Inverse FWHT K dequant for all turbo types (2026-04-03)
+
+**Hypothesis**: turbo4's inv_fwht gave +167% prefill. Extending inv_fwht to turbo3/turbo2/turbo3_tcq/turbo2_tcq
+should eliminate Q rotation kernel and speed up prefill for all turbo types.
+
+**Setup**: dorei RTX 3090, Qwen3.5-27B Q6_K, TURBO_TCQ_ALPHA_V=1.04, -fa 1, -r 3
+
+### Prefill speed (t/s)
+
+| KV type | pp2048 baseline | pp2048 inv_fwht | pp8192 baseline | pp8192 inv_fwht |
+|---------|----------------|-----------------|-----------------|-----------------|
+| turbo3 | 1129.95 | 1131.93 (+0.2%) | 1100.01 | 1102.86 (+0.3%) |
+| turbo3_tcq | 1014.38 | 1016.52 (+0.2%) | — | — |
+| f16 (ref) | 1131.21 | — | — | — |
+
+### Decode speed (t/s, tg64 after pp2048)
+
+| KV type | baseline | inv_fwht | change |
+|---------|----------|----------|--------|
+| turbo3 | 30.13 | 30.01 | -0.4% |
+| turbo3_tcq | 29.60 | 29.53 | -0.2% |
+
+### KLD quality (2K ctx, 8 chunks, mean KLD)
+
+| KV type | baseline | inv_fwht | change |
+|---------|----------|----------|--------|
+| turbo3 | 0.074767 | 0.076506 | +2.3% regression |
+| turbo3_tcq | 0.055228 | 0.059375 | +7.5% regression |
+
+### Analysis
+
+- **Zero speed improvement**: Q rotation kernel is negligible relative to FFN compute on dense 27B model.
+- **KLD regression from fp16 precision loss**: inv_fwht produces K in original domain where values are
+  non-uniform (channel_scale_inv amplifies some, shrinks others). Rotated-domain values are uniform
+  (that's the point of FWHT) → fp16 truncation is more benign in rotated domain.
+- For QK=32 types (turbo3/turbo2): additional precision loss from mixing 4 different per-block norms
+  through butterfly passes before fp16 cast. Baseline preserves per-block norm precision.
+- turbo4's inv_fwht (QK=128, single norm) doesn't have the multi-norm mixing issue, which is likely
+  why it was viable. The channel_scale_inv precision loss may exist for turbo4 too but wasn't caught.
+
+### Conclusion
+
+**Result: regression.** Reverted. The FWHT rotation that improves quantization also improves fp16
+representation — taking values back to original domain before fp16 cast is counterproductive.
