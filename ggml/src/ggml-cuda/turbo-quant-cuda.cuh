@@ -636,11 +636,12 @@ static __constant__ float d_tcq_norm_alpha_v = 1.04f;
 
 // TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis
 // 512 threads per block (one per trellis state), one block per 128-element group
-// Backtrace stored in shared memory (32KB, 4-bit packed)
+// Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<typename idx_t>
 static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo3_tcq * __restrict__ dst, const int64_t ne_total_groups,
+        uint8_t * __restrict__ bt_buf,
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -668,13 +669,14 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     block_turbo3_tcq * dst_blk = (block_turbo3_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
                                   + (i00 / QK_TURBO3_TCQ);
 
-    // Shared memory layout:
+    // Shared memory layout (~5KB, was ~35KB before global bt optimization):
     // x[128]     : rotated+normalized input (also reused as outputs[] after Viterbi)
-    // cost[512]  : current path costs (also reused for reductions)
-    // bt[128][256]: backtrace, 4-bit packed (best predecessor index 0-7)
+    // cost[512]  : path costs buffer A (also reused for reductions)
+    // cost_b[512]: path costs buffer B (double-buffering eliminates 2/3 of syncs)
+    // Backtrace: bt_buf in global memory, 128×512 bytes per block (byte-packed)
     __shared__ float x[128];
     __shared__ float cost[512];
-    __shared__ uint8_t bt[128][256]; // 32KB: bt[t][s/2] = (pred_s_even) | (pred_s_odd << 4)
+    __shared__ float cost_b[512];
     __shared__ int warp_min_idx[16];
     __shared__ float warp_min_cost[16];
     __shared__ int shared_initial_state;
@@ -742,11 +744,17 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
 
     float saved_norm = cost[0];
 
-    // Viterbi forward pass: free initial state (all equally viable)
+    // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
+    // Backtrace in global memory: byte-packed, no nibble conflicts
+    uint8_t * bt = bt_buf + (int64_t)blockIdx.x * (128 * 512);
     cost[sid] = 0.0f;
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
+        // Double-buffer: even steps read cost/write cost_b, odd steps read cost_b/write cost
+        float * cost_rd = (t & 1) ? cost_b : cost;
+        float * cost_wr = (t & 1) ? cost   : cost_b;
+
         float xt = x[t];
 
         // Right-shift trellis: ns = (prev >> 3) | (out << 6)
@@ -758,26 +766,18 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         float best = 1e30f;
         int best_p = 0;
         for (int p = 0; p < 8; p++) {
-            float c = cost[base_prev | p];
+            float c = cost_rd[base_prev | p];
             if (c < best) {
                 best = c;
                 best_p = p;
             }
         }
 
-        __syncthreads();
-        cost[sid] = best + dist;
-
-        // Store backtrace: 4-bit packed, 2 entries per byte
-        if (sid % 2 == 0) {
-            bt[t][sid / 2] = (uint8_t)best_p;
-        }
-        __syncthreads();
-        if (sid % 2 == 1) {
-            bt[t][sid / 2] |= ((uint8_t)best_p) << 4;
-        }
+        cost_wr[sid] = best + dist;
+        bt[t * 512 + sid] = (uint8_t)best_p;
         __syncthreads();
     }
+    // After 128 steps (even count): final costs are in cost[] (step 127 writes to cost)
 
     // Warp argmin over 512 costs
     {
@@ -809,13 +809,13 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     if (d_tcq_dump_max > 0 && group < d_tcq_dump_max && sid < 128)
         d_tcq_dump_x_buf[group * 128 + sid] = x[sid];
 
-    // Backtrack (inherently sequential)
+    // Backtrack (inherently sequential, reads global bt)
     uint8_t * outputs = (uint8_t *)x;
     if (sid == 0) {
         int state = shared_initial_state;
         for (int t = 127; t >= 0; t--) {
             outputs[t] = (uint8_t)(state >> 6);
-            int p = (bt[t][state / 2] >> ((state % 2) * 4)) & 0xF;
+            int p = bt[t * 512 + state];
             state = ((state & 0x3F) << 3) | p;
         }
         shared_initial_state = state;
@@ -949,10 +949,12 @@ static __constant__ float d_turbo2_tcq_codebook[256] = {
 };
 
 // 2-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=2, L=8)
+// Double-buffered cost arrays + global memory backtrace (128 syncs/group, was 384)
 template<typename idx_t>
 static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo2_tcq * __restrict__ dst, const int64_t ne_total_groups,
+        uint8_t * __restrict__ bt_buf,
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -981,7 +983,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
 
     __shared__ float x[128];
     __shared__ float cost[256];
-    __shared__ uint8_t bt[128][128]; // 256 states, 4-bit packed (2 per byte), safe even/odd serialization
+    __shared__ float cost_b[256];   // double-buffering for Viterbi
     __shared__ int warp_min_idx[8];
     __shared__ float warp_min_cost[8];
     __shared__ int shared_initial_state;
@@ -1048,11 +1050,15 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
 
     float saved_norm = cost[0];
 
-    // Viterbi forward pass: free initial state (all equally viable)
+    // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
+    uint8_t * bt = bt_buf + (int64_t)blockIdx.x * (128 * 256);
     cost[sid] = 0.0f;
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
+        float * cost_rd = (t & 1) ? cost_b : cost;
+        float * cost_wr = (t & 1) ? cost   : cost_b;
+
         float xt = x[t];
 
         // Right-shift trellis (k=2, L=8): ns = (prev >> 2) | (out << 6)
@@ -1064,26 +1070,18 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         float best = 1e30f;
         int best_p = 0;
         for (int p = 0; p < 4; p++) {
-            float c = cost[base_prev | p];
+            float c = cost_rd[base_prev | p];
             if (c < best) {
                 best = c;
                 best_p = p;
             }
         }
 
-        __syncthreads();
-        cost[sid] = best + dist;
-
-        // Store backtrace: 4-bit packed, 2 entries per byte (safe even/odd serialization)
-        if (sid % 2 == 0) {
-            bt[t][sid / 2] = (uint8_t)(best_p & 0x3);
-        }
-        __syncthreads();
-        if (sid % 2 == 1) {
-            bt[t][sid / 2] |= ((uint8_t)(best_p & 0x3)) << 4;
-        }
+        cost_wr[sid] = best + dist;
+        bt[t * 256 + sid] = (uint8_t)best_p;
         __syncthreads();
     }
+    // After 128 steps (even count): final costs in cost[]
 
     // Warp argmin over 256 costs
     {
@@ -1115,13 +1113,13 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
         d_tcq_dump_x_buf[grp * 128 + sid] = x[sid];
 
-    // Backtrack (inherently sequential)
+    // Backtrack (inherently sequential, reads global bt)
     uint8_t * outputs = (uint8_t *)x;
     if (sid == 0) {
         int state = shared_initial_state;
         for (int t = 127; t >= 0; t--) {
             outputs[t] = (uint8_t)(state >> 6);
-            int p = (bt[t][state / 2] >> ((state % 2) * 4)) & 0x3;
+            int p = bt[t * 256 + state];
             state = ((state & 0x3F) << 2) | p;
         }
         shared_initial_state = state;

@@ -336,6 +336,17 @@ static void set_rows_cuda(
     }
 }
 
+// Global backtrace buffer for Viterbi (replaces 32KB shared memory per block)
+static uint8_t * tcq_bt_buf = nullptr;
+static int64_t   tcq_bt_buf_bytes = 0;
+
+static void ensure_tcq_bt_buf(int64_t bytes_needed) {
+    if (bytes_needed <= tcq_bt_buf_bytes) return;
+    if (tcq_bt_buf) cudaFree(tcq_bt_buf);
+    cudaMalloc(&tcq_bt_buf, bytes_needed);
+    tcq_bt_buf_bytes = bytes_needed;
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -502,11 +513,12 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             load_tcq_norm_alpha();
             init_tcq_error_dump();
         }
-        // TCQ Viterbi encode: 512 threads per block (one per trellis state)
+        // TCQ Viterbi encode: 512 threads per block, global bt buffer (128×512 bytes/block)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
+            ensure_tcq_bt_buf(ne_total_groups * 128 * 512);
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
@@ -514,7 +526,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, 0, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
@@ -541,11 +553,12 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             load_tcq_norm_alpha();
             init_tcq_error_dump();
         }
-        // 2-bit TCQ Viterbi encode: 256 threads per block (one per trellis state, L=8)
+        // 2-bit TCQ Viterbi encode: 256 threads per block, global bt buffer (128×256 bytes/block)
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
+            ensure_tcq_bt_buf(ne_total_groups * 128 * 256);
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
@@ -553,7 +566,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, 0, stream>>>(
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
-                ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
