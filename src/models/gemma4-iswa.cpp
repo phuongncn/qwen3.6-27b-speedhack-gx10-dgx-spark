@@ -1,4 +1,5 @@
 #include "models.h"
+#include "ggml.h"
 
 llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
@@ -10,7 +11,10 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     inpL = build_inp_embd(model.tok_embd);
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+    // BF16 precision: match training-time BF16 rounding for embedding scale
+    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_BF16);
+    inpL = ggml_scale(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
+    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -139,8 +143,11 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             cb(cur_moe, "ffn_norm_2", il);
 
             // custom MoE logits calculation (router operates on attn_out, not cur)
-            ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
-            tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
+            // BF16 precision: match training-time BF16 rounding for router norm+scale
+            ggml_tensor * tmp = ggml_cast(ctx0, attn_out, GGML_TYPE_BF16);
+            tmp = ggml_rms_norm(ctx0, tmp, hparams.f_norm_rms_eps);
+            tmp = ggml_scale(ctx0, tmp, 1.0f / ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf((float) n_embd))));
+            tmp = ggml_cast(ctx0, tmp, GGML_TYPE_F32);
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
@@ -266,7 +273,10 @@ ggml_tensor * llm_build_gemma4_iswa::get_per_layer_inputs() {
         res->t_inp_tokens = inp->tokens;
         inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, inp->tokens);
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
-        inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float) n_embd_per_layer));
+        // BF16 precision: match training-time BF16 rounding for per-layer embedding scale
+        inp_per_layer = ggml_cast(ctx0, inp_per_layer, GGML_TYPE_BF16);
+        inp_per_layer = ggml_scale(ctx0, inp_per_layer, ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf((float) n_embd_per_layer))));
+        inp_per_layer = ggml_cast(ctx0, inp_per_layer, GGML_TYPE_F32);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
         res->add_input(std::move(inp));
     } else {

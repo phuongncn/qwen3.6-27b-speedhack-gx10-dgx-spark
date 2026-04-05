@@ -4203,3 +4203,562 @@ should eliminate Q rotation kernel and speed up prefill for all turbo types.
 
 **Result: regression.** Reverted. The FWHT rotation that improves quantization also improves fp16
 representation — taking values back to original domain before fp16 cast is counterproductive.
+
+## Turbo Head Padding (2026-04-03)
+
+Zero-pad head_dim to nearest multiple of 128 for FWHT. Parseval's theorem guarantees correct inner products.
+
+### PPL (2K ctx, 4 chunks)
+
+| Model | head_dim | pad_to | q8_0 | turbo3 | overhead |
+|-------|----------|--------|------|--------|----------|
+| Phi-3-mini 3B Q8_0 | 96 | 128 | 6.7773 | 7.1602 | +5.6% |
+| Qwen3.5-27B Q6_K | 256 | - | - | 6.3364 | (regression check, no padding) |
+| MN-Violet-Lotus 12B Q4_K_M | 128 | - | - | 5.2123 | (regression check, no padding) |
+| Qwen3-14B Q5_K_M | 128 | - | - | 9.9720 | (regression check, no padding) |
+
+### Decode Speed tg64
+
+| Model | head_dim | turbo3 | q8_0 (FA) | ratio |
+|-------|----------|--------|-----------|-------|
+| Phi-3-mini 3B Q8_0 | 96→128 | 113.4 | 153.7 | 73.8% |
+
+Note: Qwen3-0.6B has head_dim=128 (NOT 64). turbo3 PPL=1689 on it (pre-existing, same on golden build).
+
+## Gemma 4 Architecture Support (2026-04-03)
+
+Cherry-picked from upstream (PR #21309 + tokenizer fix #21343). ISWA, MoE, PLE, K=V, shared KV layers.
+
+### PPL (wikitext-2, q8_0 KV cache)
+
+| Model | Context | Our Build | Upstream | Notes |
+|-------|---------|-----------|----------|-------|
+| gemma-4-26B-A4B-it Q6_K | 512 (4 chunks) | 269.0 | 233.8 | IT MoE model, high PPL expected |
+| gemma-4-26B-A4B-it Q6_K | 2048 (4 chunks) | 416.5 | 444.6 | FA disabled on both builds |
+
+Note: High PPL is expected for instruction-tuned MoE models on raw wikitext. The important comparison is ours vs upstream — they are in the same ballpark, confirming correct architecture implementation.
+
+### Generation test (q8_0 KV, llama-cli interactive)
+
+gemma-4-26B-A4B-it Q6_K, ngl 99, prompt "The capital of France is":
+- Output: "The capital of France is **Paris**." (correct!)
+- Prompt: 342.6 t/s
+- Generation: 112.9 t/s
+
+### Turbo3 KV cache on Gemma 4 — MIXED (f16 global + turbo3 SWA, pre D=512 fix)
+
+Global layers (5/30) have head_dim=512. Turbo FA VEC kernel capped at 256.
+Fix: auto-fallback to f16 KV for head_dim>256 layers. SWA layers (25/30, head_dim=256) use turbo3.
+
+| Config | PPL | vs baseline |
+|--------|-----|-------------|
+| q8_0 baseline (FA on) | 385.5 | - |
+| turbo3 K-only (V=f16) | 485.7 | +26% |
+| turbo3 K+V | 848.4 | +120% |
+
+### Turbo3 KV cache on Gemma 4 — UNIFORM (D=512 VEC kernel, all 30 layers turbo3)
+
+Extended VEC kernel to D=512. Fixed 3 issues: head_dim switch missing `case 512`, MMA prefill
+D>256 fallback to VEC, decode dequant→fp16 at D=512 routing to MMA. D=512 now VEC-only.
+
+#### PPL (wikitext-2, 2K ctx, 4 chunks)
+
+| Config | PPL | vs baseline |
+|--------|-----|-------------|
+| q8_0 baseline | 444.1 | - |
+| turbo3 K-only (V=q8_0) | 436.7 | **-1.7%** |
+| turbo3 V-only (K=q8_0) | 753.0 | +70% |
+| turbo3 K+V | 814.2 | +83% |
+
+**CAVEAT**: These are 2K context (4 chunks) only. K/V error contributions flip at longer contexts
+(see context crossover study) — K-only may degrade and V-only may partially recover at 8K+.
+Need longer-context testing before drawing conclusions. V degradation is severe enough (+70%)
+that it likely won't fully recover, but K-only "free" result may not hold.
+
+#### Decode speed (tg64, -p 0 -n 64, FA on)
+
+| Config | t/s | vs q8_0 |
+|--------|-----|---------|
+| q8_0 K+V | 128.6 | - |
+| turbo3 K + q8_0 V | 109.2 | 85% |
+| turbo3 K+V | 97.8 | 76% |
+
+Decode speed is 76-85% of q8_0. MoE compute dominates — KV bandwidth savings are diluted.
+
+#### Context scaling (Gemma 4 26B, turbo3, 4 chunks except 16K=2 chunks)
+
+| Context | q8_0 | K-only | K% | V-only | V% | K+V | K+V% |
+|---------|------|--------|----|--------|----|-----|------|
+| 2K | 444 | 437 | -1.7% | 753 | +70% | 814 | +83% |
+| 4K | 500 | 496 | -0.7% | 1014 | +103% | 999 | +100% |
+| 8K | 2447 | 2608 | +6.6% | 17341 | +609% | 22189 | +807% |
+| 16K | 2354 | 2519 | +7.0% | — | — | 58080 | +2367% |
+
+**K/V crossover confirmed**: K-only flips from beneficial (-1.7%) to harmful (+7%) by 8K.
+V degradation is catastrophic at all lengths and accelerates with context.
+
+**WARNING**: Baseline PPL itself degrades past 4K (500→2447). Gemma 4 26B has SWA window=1024,
+so 25/30 layers can't see past 1024 tokens. Long-context PPL is dominated by SWA blindness,
+making this model unsuitable for characterizing turbo3 context scaling behavior.
+
+For turbo3 context scaling conclusions, use Qwen3.5-27B (full attention, no SWA).
+
+### TheTom fork comparison on Gemma 4 26B (2K ctx, 4 chunks)
+
+Built TheTom `feature/turboquant-kv-cache` branch (bc05a68) on dorei with same cmake flags.
+
+| Config | TheTom PPL | TheTom % | Ours PPL | Ours % |
+|--------|-----------|----------|---------|--------|
+| q8_0 baseline | 403.9 | - | 444.1 | - |
+| turbo3 K-only | 462.5 | +14.5% | 436.7 | -1.7% |
+| turbo3 V-only | 507.1 | +25.6% | 753.0 | +70% |
+| turbo3 K+V | 766.7 | +89.8% | 814.2 | +83% |
+
+**Analysis**:
+- Different q8_0 baselines (403.9 vs 444.1) — different upstream merge points, compare % not absolute.
+- **K**: Ours is much better (-1.7% vs +14.5%) — FWHT rotation helps K quantization significantly.
+- **V**: TheTom is much better (+25.6% vs +70%) — Boundary V + Sparse V features help V quality.
+- **K+V**: Both are bad (~+90%). Neither fork makes Gemma 4 turbo3 K+V usable.
+- Both forks show Gemma 4 V quantization as the bottleneck — K=V shared projections are the issue.
+
+### Gemma 4 31B (dense) — turbo3 results
+
+60 layers: 50 SWA (head_dim=256) + 10 global (head_dim=512). D=512 VEC kernel.
+
+#### PPL (wikitext-2, 2K ctx, 4 chunks)
+
+| Config | PPL | vs baseline |
+|--------|-----|-------------|
+| q8_0 baseline | 315.7 | - |
+| turbo3 K-only (V=q8_0) | 283.4 | **-10.2%** |
+| turbo3 V-only (K=q8_0) | 388.0 | +22.9% |
+| turbo3 K+V | 332.4 | +5.3% |
+
+K turbo3 IMPROVES PPL on 31B (FWHT rotation helps). V turbo3 still degrades but much
+less than 26B MoE (+23% vs +70%). Combined K+V only +5.3% — K benefit partially cancels V cost.
+Dense model benefits more than MoE from turbo3 KV cache.
+
+#### Decode speed (tg64, -p 0 -n 64, FA on)
+
+| Config | t/s | vs q8_0 |
+|--------|-----|---------|
+| q8_0 K+V | 33.4 | - |
+| turbo3 K + q8_0 V | 30.1 | 90% |
+| turbo3 K+V | 27.9 | 83% |
+
+Dense model is more compute-bound than MoE, so turbo speed gains are modest.
+Tentative config for Gemma 4 31B: **turbo3 K+V** (only +5% PPL at 2K, 83% speed).
+**CAVEAT**: Same K/V crossover warning as 26B — need longer context validation.
+
+### Regression check (Qwen3.5-27B, 2K ctx, 8 chunks)
+
+| Config | PPL | Golden |
+|--------|-----|--------|
+| turbo3 K+V | 5.8501 | 5.8377 |
+
+No regression from head padding + FA ordering + head_dim fallback changes (+0.02%).
+
+### Gemma 4 26B — KLD analysis + layer-adaptive modes (2026-04-03)
+
+Base logits: `/root/base_logits_gemma4/f16_2048.logits` (f16 KV, 2K ctx, 16 chunks)
+f16 baseline PPL: 312.69
+
+**Key finding**: Even q8_0 has KLD 0.509 on Gemma 4 (vs 0.0046 on Qwen 27B = 110x worse).
+30 consecutive quantized softmax attention layers with no clean breaks is the root cause.
+
+#### KLD sweep — uniform turbo3_tcq (2K, 16 chunks)
+
+| Alpha V | Mean KLD | PPL |
+|---------|----------|-----|
+| 0.96 | 1.234 | — |
+| 0.98 | 1.250 | — |
+| 1.00 | 1.236 | — |
+| 1.02 | 1.306 | — |
+| 1.04 | 1.227 | — |
+| 1.05 | 1.257 | — |
+| **1.06** | **1.154** | 283.6 |
+| 1.07 | 1.259 | — |
+| 1.08 | 1.307 | — |
+| 1.10 | 1.292 | — |
+
+Optimal V alpha for Gemma 4 = 1.06 (vs 1.04 for Qwen 27B). Confirmed by KLD, not just PPL.
+
+#### Full KLD comparison table (2K, 16 chunks)
+
+| Config | Mean KLD | vs q8_0 | PPL | PPL vs q8_0 |
+|--------|----------|---------|-----|-------------|
+| q8_0 | 0.509 | 1.00x | 319.6 | — |
+| K-only turbo3 | 1.138 | 2.24x | — | — |
+| V-only turbo3 | 1.388 | 2.73x | — | — |
+| turbo3 uniform | 1.696 | 3.33x | 517.2 | +61.8% |
+| turbo3 mode 16 (every 4th q8_0) | 1.363 | 2.68x | 371.3 | +16.2% |
+| turbo3 mode 18 (every 2nd q8_0) | 1.192 | 2.34x | 282.4 | -11.6% |
+| TCQ uniform α=1.06 | 1.154 | 2.27x | 283.6 | -11.2% |
+| TCQ mode 16 α=0.98 | 1.080 | 2.12x | 323.0 | +1.1% |
+| TCQ mode 18 α=1.06 | 0.931 | 1.83x | — | — |
+
+**Insights**:
+- PPL can be misleading (TCQ mode 18 -11.6% PPL but mode 16 has lower KLD per q8_0-bit spent)
+- Periodic q8_0 layers do NOT dampen errors — more q8_0 (mode 17) was worse than less (mode 16)
+- q8_0 itself injects substantial error on this architecture
+- TCQ α must be tuned per model (1.04 Qwen vs 1.06 Gemma 4)
+- Layer-adaptive TCQ requires different alpha than uniform (alpha calibrated for amount of turbo context)
+
+#### Architecture-aware layer-adaptive modes (PPL, 16 chunks)
+
+| Mode | Description | PPL | vs q8_0 (319.6) |
+|------|-------------|-----|-----------------|
+| 12 | q8_0 global + turbo3 SWA | 785 | +145% |
+| 13 | q8_0 global V + turbo3 SWA | — | — |
+| 14 | turbo3 global + q8_0 SWA | — | — |
+| 15 | turbo3 global + q8_0 SWA V | — | — |
+| 16 | every 4th layer q8_0 (8/30) | 371.3 | +16.2% |
+| 17 | every 3rd layer q8_0 (10/30) | worse than 16 | — |
+| 18 | every 2nd layer q8_0 (15/30) | 282.4 | -11.6% |
+
+### Per-Layer Alpha — Qwen3.5-27B (2K ctx, 8 chunks, PPL screening)
+
+Per-layer V alpha: `α_l = base + slope * (l / 39)` for 40 layers.
+Uniform TCQ α=1.04 baseline PPL = 6.8301.
+
+#### base=0.98 (PPL only — screening pass)
+
+| slope | PPL | layer 0 → layer 39 |
+|-------|-----|--------------------|
+| -0.10 | 7.2011 | 0.98 → 0.88 |
+| -0.06 | 7.0942 | 0.98 → 0.92 |
+| -0.02 | 7.0125 | 0.98 → 0.96 |
+| 0.00 | 6.9818 | 0.98 → 0.98 |
+| +0.02 | 6.9374 | 0.98 → 1.00 |
+
+**Finding**: Clear monotonic improvement with positive slope. Deeper layers benefit from higher alpha.
+This confirms a depth-dependent quantization error pattern — novel finding for the paper.
+
+#### Full KLD Sweep — Per-Layer Alpha (2K ctx, 16 chunks, COMPLETE 2026-04-03)
+
+Per-layer V alpha: `α_l = base + slope * (l / 39)` for 40 layers.
+Uniform TCQ α=1.04 baseline KLD = **0.051270**.
+
+| base | slope | layer 0 → 39 | Mean KLD | PPL(Q) | vs uniform |
+|------|-------|--------------|----------|--------|------------|
+| — | uniform α=1.04 | 1.04 → 1.04 | **0.051270** | 5.7984 | — |
+| 1.00 | 0.00 | 1.00 → 1.00 | 0.061003 | 5.8684 | +19.0% |
+| 1.00 | +0.02 | 1.00 → 1.02 | 0.056291 | 5.8530 | +9.8% |
+| 1.00 | +0.04 | 1.00 → 1.04 | 0.057305 | 5.8398 | +11.8% |
+| 1.00 | +0.06 | 1.00 → 1.06 | 0.065583 | 5.8139 | +27.9% |
+| 1.00 | +0.08 | 1.00 → 1.08 | 0.062189 | 5.7794 | +21.3% |
+| 1.00 | +0.10 | 1.00 → 1.10 | 0.066799 | 5.7961 | +30.3% |
+| 1.00 | +0.14 | 1.00 → 1.14 | 0.082138 | 5.7815 | +60.2% |
+| 1.02 | 0.00 | 1.02 → 1.02 | 0.057697 | 5.8336 | +12.5% |
+| 1.02 | +0.02 | 1.02 → 1.04 | 0.059091 | 5.7827 | +15.3% |
+| 1.02 | +0.04 | 1.02 → 1.06 | 0.058412 | 5.8188 | +13.9% |
+| 1.02 | +0.06 | 1.02 → 1.08 | 0.068383 | 5.7600 | +33.4% |
+| 1.02 | +0.08 | 1.02 → 1.10 | 0.074159 | 5.8136 | +44.7% |
+| 1.02 | +0.10 | 1.02 → 1.12 | 0.074141 | 5.7710 | +44.6% |
+| 1.02 | +0.14 | 1.02 → 1.16 | 0.086908 | 5.7442 | +69.6% |
+| 1.04 | 0.00 | 1.04 → 1.04 | **0.051270** | 5.7984 | 0.0% ✓ |
+| 1.04 | +0.02 | 1.04 → 1.06 | 0.060794 | 5.8024 | +18.6% |
+| 1.04 | +0.04 | 1.04 → 1.08 | 0.067118 | 5.7594 | +30.9% |
+| 1.04 | +0.06 | 1.04 → 1.10 | 0.075267 | 5.7791 | +46.8% |
+| 1.04 | +0.08 | 1.04 → 1.12 | 0.080651 | 5.7692 | +57.3% |
+| 1.04 | +0.10 | 1.04 → 1.14 | 0.078937 | 5.7442 | +54.0% |
+| 1.04 | +0.14 | 1.04 → 1.18 | 0.094316 | 5.7255 | +84.0% |
+| 1.06 | 0.00 | 1.06 → 1.06 | 0.065156 | 5.7759 | +27.1% |
+| 1.06 | +0.02 | 1.06 → 1.08 | 0.065415 | 5.7683 | +27.6% |
+| 1.06 | +0.04 | 1.06 → 1.10 | 0.081156 | 5.7571 | +58.3% |
+| 1.06 | +0.06 | 1.06 → 1.12 | 0.080154 | 5.7400 | +56.4% |
+| 1.06 | +0.08 | 1.06 → 1.14 | 0.079286 | 5.7276 | +54.6% |
+| 1.06 | +0.10 | 1.06 → 1.16 | 0.092015 | 5.7224 | +79.5% |
+| 1.06 | +0.14 | 1.06 → 1.20 | 0.104135 | 5.7590 | +103.2% |
+
+**DEFINITIVE RESULT: No linear per-layer alpha gradient beats uniform α=1.04 on KLD.**
+
+Key findings:
+1. **Uniform α=1.04 is optimal** — the flat row (base=1.04, slope=0.00) exactly matches uniform (0.051270 = 0.051270), validating the implementation
+2. **Every positive slope degrades KLD** — even the smallest tested (+0.02) worsens KLD by 18-28% depending on base
+3. **PPL and KLD diverge dramatically** — base=1.06 slope=+0.14 has the lowest PPL (5.722) but the WORST KLD (0.104, +103%). This confirms PPL is a fraudulent optimization target for per-layer tuning
+4. **The PPL "improvement" from slopes is illusory** — the PPL screening showed monotonically better PPL with positive slope, but KLD shows monotonically WORSE distributional fidelity
+5. **Depth-dependent alpha hurts because all layers need the same correction** — the α=1.04 "sweet spot" reflects a global property of the FWHT + quantization pipeline, not a per-layer effect
+
+This is still a publishable negative result: linear depth gradients do not help despite PPL suggesting otherwise, demonstrating that PPL-based optimization of KV cache quantization parameters is unreliable.
+
+---
+
+## Speed Experiments Campaign — 2026-04-05
+
+**Hardware**: RTX 3090 24GB, dorei
+**Model**: Qwen3.5-27B-heretic Q6_K (20.56 GiB)
+**Build**: master (dd3b8c880), fresh /root/exp-baseline/
+
+### Fresh Baseline (master, 2026-04-05)
+
+| Config | pp512 | pp4096 | tg64 @0K | tg64 @4K | tg64 @16K | tg64 @32K |
+|--------|-------|--------|----------|----------|-----------|-----------|
+| f16 K+V | — | — | 31.23 | — | — | — |
+| q8_0 K+V | — | — | 30.77 | — | — | — |
+| turbo3_tcq K+V | 1016.78 | 1009.93 | 29.56 | 29.60 | 29.52 | 29.54 |
+
+turbo3_tcq decode: 96.1% of q8_0, 94.7% of f16. Stable across contexts.
+
+### S2: GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1
+
+| Config | tg64 baseline | tg64 +FP16 | Delta |
+|--------|--------------|------------|-------|
+| turbo3_tcq | 29.56 | 29.75 | +0.6% |
+| q8_0 | 30.77 | 30.86 | +0.3% |
+| f16 | 31.23 | 31.27 | +0.1% |
+
+**Verdict: NO meaningful improvement.** FP16 cuBLAS compute is within noise. Weight GEMM on Q6_K likely uses MMQ path (not cuBLAS), so this env var doesn't affect the bottleneck.
+
+### S1: GGML_CUDA_FORCE_MMQ=ON rebuild
+
+| Config | tg64 baseline | tg64 MMQ | Delta |
+|--------|--------------|----------|-------|
+| turbo3_tcq | 29.56 | 29.58 | +0.1% |
+| q8_0 | 30.77 | 30.76 | -0.0% |
+| f16 | 31.23 | 31.09 | -0.4% |
+
+**Verdict: NO improvement.** llama.cpp already auto-selects optimal kernel for Q6_K on Ampere. MMQ doesn't help.
+
+### S3: TCQ Codebook → Shared Memory
+
+Move 512-entry TCQ codebook from `__constant__` to `__shared__` memory for 32-bank parallel access.
+Refactored TCQ functions into `_impl` variants with explicit codebook pointer, used `if constexpr` dispatch in fattn-vec.cuh.
+
+| Context | tg64 baseline | tg64 SMEM | Delta |
+|---------|--------------|-----------|-------|
+| ~2K | 29.63 | 29.59 | -0.1% |
+| 16K | 29.61 | 29.55 | -0.2% |
+| 32K | 29.54 | 29.55 | +0.0% |
+
+**Verdict: NO improvement.** Constant cache is NOT the codebook bottleneck. 2KB codebook fits entirely in constant cache (64KB on Ampere), and 128 threads accessing 512 entries has enough locality. Confirms TheTom's finding: "constant memory LUT is at hardware floor." Bottleneck is HOW MANY values are dequantized, not HOW.
+
+### S5: Skip Softmax (tile-level attention skipping)
+
+Skip entire KV tiles during flash attention when all tile scores are far below running max.
+After computing QK for a tile of 128 positions, if `tile_max < KQ_max - 20` (exp(-20) ≈ 2e-9),
+skip softmax computation, V load, V dequant, and V accumulation entirely.
+
+| Context | tg64 baseline | tg64 SkipSoftmax | Delta |
+|---------|--------------|------------------|-------|
+| ~2K | 29.63 | 29.61 | -0.1% |
+| 16K | 29.61 | 29.60 | -0.0% |
+| 32K | 29.54 | 29.56 | +0.1% |
+| 65K | 29.54 | 29.55 | +0.0% |
+
+**Verdict: NO measurable improvement.** The optimization is correct but attention is too small a fraction of decode time. Measured attention cost: 0.7% at 32K (f16 KV), 0.3% at 65K (turbo3_tcq). Even skipping 50% of tiles saves <0.15% wall time. Weight GEMM dominates 99%+ of decode on Qwen3.5-27B (4 KV heads).
+
+### KEY FINDING: Attention is <1% of Decode on Qwen3.5-27B
+
+| Context | f16 KV tok/s | turbo3_tcq tok/s | Attention fraction (f16) | Attention fraction (turbo3) |
+|---------|-------------|-----------------|------------------------|-----------------------------|
+| ~2K | 31.26 | 29.63 | ~0% (reference) | ~0% (reference) |
+| 32K | 31.04 | 29.54 | 0.7% | 0.3% |
+| 65K | OOM | 29.54 | N/A | 0.3% |
+
+**This means ALL attention-only optimizations (S3, S5-S18) are invisible on this model at batch_size=1 decode.** Remaining experiments that only touch attention are not worth testing on this model. Need either: MoE (cheaper FFN), many more KV heads, or much longer context (100K+).
+
+### Prefill Bottleneck Analysis
+
+| Length | f16 | q8_0 | turbo3 | turbo3_tcq | tcq/f16 | turbo3/f16 |
+|--------|-----|------|--------|------------|---------|------------|
+| pp512 | 1151 | 1146 | 1143 | 1026 | 89.1% | 99.3% |
+| pp2048 | 1148 | 1145 | 1134 | 1021 | 89.0% | 98.8% |
+| pp4096 | 1138 | 1132 | 1120 | 1013 | 89.0% | 98.4% |
+| pp8192 | 1115 | 1109 | 1096 | 990 | 88.8% | 98.3% |
+
+**KEY**: turbo3 (non-TCQ) is 98-99% of f16 prefill. turbo3_tcq is 89% of f16. The entire 10% gap is **Viterbi TCQ encoding** in set-rows.cu, NOT attention dequant. This is the target for S12 (fast encode).
+
+### CUDA Graphs Impact
+
+| turbo3_tcq tg64 | With Graphs | Without Graphs | Delta |
+|-----------------|-------------|----------------|-------|
+| @2K | 29.63 | 28.73 | +3.1% |
+
+CUDA Graphs already enabled in our build. Working correctly, providing +3.1% decode.
+
+### S12: Fast Encode — Greedy TCQ (2026-04-05)
+
+**Single-thread greedy** (start from state 0, pick locally optimal at each step):
+- Prefill pp512: 1112 t/s (+8.4% vs Viterbi 1026)
+- Decode tg64@2K: 30.45 t/s (+2.7% vs Viterbi 29.75)
+- PPL: **17.09** vs Viterbi 5.84 — TERRIBLE. Greedy from state 0 gets trapped in bad local paths.
+
+**Multi-start greedy** (all 512 threads run independent greedy from different start states, argmin picks best):
+- Prefill pp512: 1031 t/s (+0.5% — argmin+rerun overhead eats the speedup)
+- Prefill pp2048: 1027 t/s
+- Prefill pp4096: 1017 t/s
+- Prefill pp8192: 997 t/s
+- PPL: **14.74** vs Viterbi 5.84 — still 2.5x worse. Multi-start helps (17.09→14.74) but greedy fundamentally can't match Viterbi.
+
+**Conclusion**: Greedy TCQ encoding is a dead end. The quality loss (2.5x PPL) is unacceptable, and multi-start adds enough overhead that it's no faster than Viterbi. The 512 states × 8 transitions × 128 steps = same total compute as Viterbi, just trades syncthreads for independent parallelism (which the 3090 handles equally well).
+
+### S4: Speculative Decoding (2026-04-05)
+
+Draft: Qwen3.5-2B Q4_K_M on CPU (no VRAM for both on 24GB).
+Target: Qwen3.5-27B Q6_K turbo3_tcq on GPU.
+
+| Metric | Spec Decode | Normal | Change |
+|--------|-------------|--------|--------|
+| Effective tok/s | ~20.1 | 31.0 | **-35%** |
+| Draft eval | 26.21 tok/s (CPU) | — | — |
+
+**Conclusion**: Dead end. Draft on CPU too slow. Both models don't fit in 24GB VRAM. Prior experiment #31 (draft on GPU with Q5_K_M target) was also slower (28.78 vs 31.0).
+
+### Weight GEMM Dominance Proof (2026-04-05)
+
+Decode tg64@2K, Qwen3.5-27B at various weight quantizations, RTX 3090.
+
+| Weights | Size | q8_0 KV | turbo3_tcq KV | tcq/q8_0 | vs Q6_K q8_0 |
+|---------|------|---------|---------------|----------|--------------|
+| Q4_K_M | 15.94 GiB | 38.63 | 36.81 | 95.3% | +24.6% |
+| Q5_K_M | 18.06 GiB | 35.19 | 33.63 | 95.6% | +13.5% |
+| Q6_K | 20.56 GiB | 31.00 | 29.70 | 95.8% | baseline |
+| Q8_0 | 27.14 GiB | — | — | — | OOM on 24GB |
+
+**Key findings**:
+1. **Weight size directly determines decode speed** — Q4_K_M is 24.6% faster than Q6_K. This is almost exactly proportional to weight size reduction (15.94/20.56 = 77.5%, so 22.5% less data → 24.6% faster).
+2. **turbo3_tcq overhead is a fixed ~4-5%** regardless of weight size (95.3-95.8% across all weight quants). This proves our attention kernels add constant overhead, not scaling overhead.
+3. **85-90% of decode is weight GEMM, confirmed** — changing weight quant from Q4_K_M to Q6_K costs 24.6%, while changing KV quant from q8_0 to turbo3_tcq costs only 4.2-4.7%.
+4. **Implication**: The only path to significantly faster turbo3_tcq decode is faster weight GEMM (S19 Marlin-style) or smaller weight quants.
+
+### S19: MMVQ Kernel Profiling with ncu + nsys (2026-04-05)
+
+**ncu kernel-level profiling** — Q6_K MMVQ kernels during decode:
+
+| Layer Size (rows) | DRAM Throughput | SM Throughput | Registers | Active Warps |
+|-------------------|----------------|---------------|-----------|--------------|
+| 17408 (FFN fused) | **94.33%** | 61.05% | 40 | 46.05 |
+| 5120 (QKV proj) | **88.36%** | 62.48% | 40 | 46.35 |
+| 12288 (FFN down) | **89.98%** | 67.17% | 40 | 46.64 |
+| 1024 (small proj) | **50.20%** | 35.67% | 40 | 43.93 |
+
+**nsys full decode pipeline** — 8-token decode, Qwen3.5-27B Q6_K:
+
+| Kernel | Time % | Instances | Avg (us) |
+|--------|--------|-----------|----------|
+| MMVQ (fused GLU) | 55.5% | 286 | 119.8 |
+| MMVQ (normal) | 28.1% | 580 | 30.0 |
+| concat_f32 | 2.7% | 96 | 17.2 |
+| quantize_q8_1 | 2.5% | 866 | 1.8 |
+| get_rows | 2.3% | 196 | 7.3 |
+| rms_norm | 2.3% | 258 | 5.4 |
+| gated_delta_net | 1.1% | 96 | 7.4 |
+| flash_attn | **0.6%** | 32 | 10.6 |
+| set_rows (KV encode) | **0.2%** | 64 | 1.9 |
+| Other (rope, scale, add) | ~4% | ~800 | ~2 |
+
+**KEY CONCLUSIONS**:
+1. **MMVQ = 83.6% of decode GPU time**. Large matrices at 88-94% peak DRAM bandwidth — AT HARDWARE WALL.
+2. **Small matrices (1024 rows) at 50% DRAM** — tail effects, ~5% of total time.
+3. **Flash attention: 0.6%**. KV encode: 0.2%. Both negligible.
+4. **Non-MMVQ overhead: ~16%** — hundreds of small kernels (RMSNorm, RoPE, concat, scale).
+5. **312 kernel launches per token.**
+6. **S19 VERDICT: No kernel rewrite can improve 88-94% DRAM throughput.** Remaining gains only from kernel fusion (S20) or smaller weight formats.
+
+## Viterbi GPU Underutilization Optimization (2026-04-04)
+
+Branch: `experiment/viterbi-opt`
+Changes: Double-buffered cost arrays + global memory backtrace (removes 32KB shared bt, reduces __syncthreads from 384 to 128 per Viterbi group)
+
+### PPL Verification (turbo3_tcq, Qwen3.5-27B Q6_K, 4 chunks)
+| Build | PPL |
+|-------|-----|
+| Baseline (master) | 6.2186 ± 0.50083 |
+| Optimized | 6.2186 ± 0.50083 |
+
+**Bit-exact** — no quality impact.
+
+### Decode Speed — Dense model (Qwen3.5-27B Q6_K, turbo3_tcq)
+| Build | tg128 tok/s |
+|-------|-------------|
+| Baseline | 29.56 ± 0.03 |
+| Optimized | 29.71 ± 0.06 |
+| **Improvement** | **+0.5%** |
+
+### Decode Speed — MoE model (Qwen3.5-35B-A3B Q4_K_S, turbo3_tcq)
+| Build | tg128 tok/s |
+|-------|-------------|
+| Baseline | 126.22 ± 0.44 |
+| Optimized | 126.97 ± 0.31 |
+| turbo3 (no TCQ) | 132.33 ± 0.27 |
+| **Improvement** | **+0.6%** |
+| **TCQ overhead (baseline)** | **4.6%** (132.33→126.22) |
+| **TCQ overhead (optimized)** | **4.1%** (132.33→126.97) |
+
+### Bank Conflict Fix (COST_PAD) — REVERTED
+Added `COST_PAD(s) = s + (s >> 5)` to eliminate 8-way bank conflicts in Viterbi predecessor lookup.
+- Result: **slower** (126.19 vs 126.97) — the extra ALU ops for padded indexing outweigh bank conflict savings
+- Viterbi is sync-bound, not bank-conflict-bound
+
+### Analysis
+The Viterbi encode kernel is a small fraction of decode time even on MoE (~4.6% overhead vs turbo3). The optimization reduced __syncthreads from 384→128 per group and freed 32KB shared memory, giving a real but modest speedup.
+
+**What limits further gains:**
+- MoE: only 4-8 blocks per launch, 82 SMs = 95% GPU idle. No per-block optimization can fix this.
+- Dense: Viterbi is ~0.2% of decode — negligible.
+- Fundamental: Viterbi has 128 sequential steps with inter-step dependencies. Cannot parallelize across steps.
+
+## S20: Eliminate quantize_q8_1 via f32 activation in MMVQ (2026-04-04)
+
+**Hypothesis**: Q6_K MMVQ is 88-94% DRAM BW-bound on weights. Reading f32 activations (16KB) vs Q8_1 (4.5KB) is negligible vs 70MB weights. Eliminating 28145 quantize_q8_1 kernel calls (2.3% of decode) should give ~2.3% speedup.
+
+**Implementation**: Added `f32_acc` template parameter to MMVQ kernel. When Q6_K + single-token decode, skips Q8_1 buffer allocation and quantize_q8_1 call. Kernel reads f32 activations directly using FMA instead of DP4A.
+
+**Results** (Qwen3.5-27B Q6_K, turbo3 KV, tg64, RTX 3090):
+| Build | tok/s |
+|-------|-------|
+| Baseline | 30.04 ± 0.02 |
+| f32_acc | 24.82 ± 0.06 |
+| **Delta** | **-17.4%** |
+
+**REJECTED**: Massive slowdown. Root cause: DP4A does 4 int8 MADs in 1 instruction; replacing with scalar FP32 FMA requires ~3.5x more instructions (2 DP4A → 7 FP32 ops per inner loop). This tips the kernel from bandwidth-bound to partially compute-bound. The 2.3% saved from eliminating quantize_q8_1 is swamped by ~17% kernel slowdown.
+
+**Lesson**: MMVQ is bandwidth-bound *at the current compute/data ratio*. DP4A is critical to keeping it that way — its 4x compute density vs FP32 is load-bearing, not just a convenience.
+
+## S19: Fused quantize-MMVQ (shared memory approach) (2026-04-04)
+
+**Hypothesis**: Instead of replacing DP4A (S20's mistake), keep DP4A but fuse the separate `quantize_q8_1` kernel INTO the MMVQ kernel. Each CUDA block quantizes f32 activations to Q8_1 in shared memory (Phase 1), then runs the identical DP4A dot product loop reading from shared memory instead of global (Phase 2). Eliminates separate kernel launch + DRAM roundtrip.
+
+**Previous attempt**: In-register quantization per-thread: **-31.5% (20.57 tok/s)**. Root cause: SFU bottleneck (FDIV/FRCP), 2.7x instruction count, and with rpb=1 each block independently quantizes — no amortization.
+
+**Shared memory redesign**: All warps cooperatively quantize the full activation vector to shared memory Q8_1 blocks (Phase 1), then __syncthreads, then run normal DP4A loop from shared memory (Phase 2).
+
+**Results** (Qwen3.5-27B Q6_K, turbo3 KV, tg64, RTX 3090):
+| Build | tok/s |
+|-------|-------|
+| Baseline | 30.04 ± 0.02 |
+| In-register fused | 20.57 ± 0.01 |
+| Shared memory fused | 8.70 ± 0.01 |
+| **Delta (shared mem)** | **-71.0%** |
+
+**REJECTED**: Even worse than in-register approach. Root cause: with `rows_per_cuda_block=1` and `__launch_bounds__(128, 1)`, each of 3584+ CUDA blocks independently quantizes the identical activation vector to its own shared memory. Phase 1 adds ~940 ns per block (L2 reads + warp shuffle reductions + shared stores), while original Phase 2 (bandwidth-bound DP4A) takes only ~260 ns per block. The 3.6x overhead per block matches the measured 3.45x slowdown. Even a persistent-kernel variant (1 block per SM, loop over rows) would only save ~1.3% after proper amortization — the separate `quantize_q8_1` kernel at 2.3% of decode is simply not worth fusing.
+
+**Lesson**: The Q8_1 pre-quantization architecture is near-optimal. Quantizing once globally (O(n)) and distributing via L2 cache beats per-block redundant quantization (O(n × nrows)) regardless of whether the per-block work is in registers or shared memory. The kernel launch overhead (~3μs × 280 calls = 0.84ms) is the true irreducible cost.
+
+## Gemma 4 BF16 Precision Fix (2026-04-05)
+
+Ported from upstream draft PR #21451. Gemma 4 was trained in BF16 on TPUs; llama.cpp computes
+in F32 which diverges from training-time BF16 rounding. Fix: cast to BF16 at 3 critical scale
+operations (embedding scale, MoE router norm+scale, per-layer embedding scale), then cast back
+to F32. Also added BF16 CUDA kernels for scale and rms_norm, and BF16 paths in binbcast.
+Fixed upstream PR's bug (MoE router used attn_out instead of cast tmp for rms_norm input).
+
+### PPL (wikitext-2, 2K ctx, Gemma 4 26B MoE Q6_K)
+
+| Config | Before BF16 fix | After BF16 fix | Change |
+|--------|-----------------|----------------|--------|
+| q8_0 baseline | 444.1 | 326.3 | -27% |
+| turbo3 K+V | 814.2 | 660.9 | -19% |
+| turbo3_tcq K+V | 517.2 | 412.8 | -20% |
+
+Relative degradation vs q8_0 baseline:
+
+| Config | Before | After |
+|--------|--------|-------|
+| turbo3 K+V | +83% | +103% |
+| turbo3_tcq K+V | +16% | +27% |
+
+Baseline improved dramatically (-27%), but relative turbo degradation slightly increased.
+BF16 fix gives a cleaner signal, making quantization errors more visible against it.
+TCQ still substantially better than plain turbo3 on Gemma 4.
