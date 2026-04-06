@@ -112,6 +112,25 @@ static __global__ void flash_attn_ext_vec(
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     __builtin_assume(tid < nthreads);
 
+    // TCQ codebook in shared memory for K and V dequant.
+    // Constant memory serializes when threads hit different 32B cache lines;
+    // shared memory gives full 32-bank parallel access for random lookups.
+    constexpr bool is_tcq3 = type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ;
+    constexpr bool is_tcq2 = type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ;
+    constexpr int smem_cb_size = is_tcq3 ? 512 : (is_tcq2 ? 256 : 0);
+    __shared__ float smem_codebook[smem_cb_size > 0 ? smem_cb_size : 1];
+    if constexpr (is_tcq3) {
+        for (int i = tid; i < 512; i += nthreads) {
+            smem_codebook[i] = d_turbo3_tcq_codebook_fattn[i];
+        }
+        __syncthreads();
+    } else if constexpr (is_tcq2) {
+        for (int i = tid; i < 256; i += nthreads) {
+            smem_codebook[i] = d_turbo2_tcq_codebook_fattn[i];
+        }
+        __syncthreads();
+    }
+
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -272,7 +291,16 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum;
+                if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
+                    sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
+                } else if constexpr (type_K == GGML_TYPE_TURBO2_TCQ) {
+                    sum = vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
+                } else {
+                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -355,6 +383,12 @@ static __global__ void flash_attn_ext_vec(
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
+                } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
+                    dequantize_V_turbo3_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
+                    dequantize_V_turbo2_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
                 } else {
                     dequantize_V(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
@@ -387,8 +421,16 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
+                    dequantize_V_turbo3_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
+                    dequantize_V_turbo2_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else {
+                    dequantize_V(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll

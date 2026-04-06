@@ -579,11 +579,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
-// TCQ 3-bit: 9-bit state from trellis bitstream → 512-entry codebook
+// TCQ 3-bit K dot product: 9-bit state → codebook lookup
+// Core implementation takes explicit codebook pointer for SMEM/constant flexibility
 template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq_cb(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
-    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const float * __restrict__ cb) {
     const block_turbo3_tcq * K_tcq = (const block_turbo3_tcq *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
@@ -608,13 +610,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
             const int lj = k_KQ_1 * 2;
             const int t0 = j_start + lj;
             const int t1 = t0 + 1;
-            // 9-bit state decode for each element
             const int bp0 = t0 * 3;
             const uint16_t raw0 = (uint16_t)K_tcq[ib].qs[bp0/8] | ((uint16_t)K_tcq[ib].qs[bp0/8 + 1] << 8);
-            const float k0 = d_turbo3_tcq_codebook_fattn[(raw0 >> (bp0 % 8)) & 0x1FF] * norm;
+            const float k0 = cb[(raw0 >> (bp0 % 8)) & 0x1FF] * norm;
             const int bp1 = t1 * 3;
             const uint16_t raw1 = (uint16_t)K_tcq[ib].qs[bp1/8] | ((uint16_t)K_tcq[ib].qs[bp1/8 + 1] << 8);
-            const float k1 = d_turbo3_tcq_codebook_fattn[(raw1 >> (bp1 % 8)) & 0x1FF] * norm;
+            const float k1 = cb[(raw1 >> (bp1 % 8)) & 0x1FF] * norm;
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
@@ -626,11 +627,20 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
     return sum;
 }
 
-// TCQ 2-bit: 8-bit state from trellis bitstream → 256-entry codebook
+// Wrapper using __constant__ codebook (for function pointer dispatch)
 template<int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_tcq(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
     const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    return vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads>(K_c, Q_v, Q_q8, Q_ds_v, d_turbo3_tcq_codebook_fattn);
+}
+
+// TCQ 2-bit K dot product: 8-bit state → codebook lookup
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq_cb(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const float * __restrict__ cb) {
     const block_turbo2_tcq * K_tcq = (const block_turbo2_tcq *) K_c;
     GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
@@ -655,13 +665,12 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
             const int lj = k_KQ_1 * 2;
             const int t0 = j_start + lj;
             const int t1 = t0 + 1;
-            // 8-bit state decode for each element
             const int bp0 = t0 * 2;
             const uint16_t raw0 = (uint16_t)K_tcq[ib].qs[bp0/8] | ((uint16_t)K_tcq[ib].qs[bp0/8 + 1] << 8);
-            const float k0 = d_turbo2_tcq_codebook_fattn[(raw0 >> (bp0 % 8)) & 0xFF] * norm;
+            const float k0 = cb[(raw0 >> (bp0 % 8)) & 0xFF] * norm;
             const int bp1 = t1 * 2;
             const uint16_t raw1 = (uint16_t)K_tcq[ib].qs[bp1/8] | ((uint16_t)K_tcq[ib].qs[bp1/8 + 1] << 8);
-            const float k1 = d_turbo2_tcq_codebook_fattn[(raw1 >> (bp1 % 8)) & 0xFF] * norm;
+            const float k1 = cb[(raw1 >> (bp1 % 8)) & 0xFF] * norm;
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
 #else
@@ -671,6 +680,14 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
         }
     }
     return sum;
+}
+
+// Wrapper using __constant__ codebook (for function pointer dispatch)
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_tcq(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    return vec_dot_fattn_vec_KQ_turbo2_tcq_cb<D, nthreads>(K_c, Q_v, Q_q8, Q_ds_v, d_turbo2_tcq_codebook_fattn);
 }
 
 template <typename Tds, int ni>
@@ -1064,11 +1081,12 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
 // When TURBO_TCQ_DECODE_ALPHA_V is set, this is loaded via fattn.cu's load_tcq_decode_alpha_fattn_common()
 static __constant__ float d_tcq_decode_alpha_v_fattn = 1.0f;
 
-// TCQ 3-bit V dequant: 9-bit state from trellis bitstream → 512-entry codebook
-// V alpha can be either baked into norm at encode time (set-rows.cu) or applied here at decode time
+// TCQ 3-bit V dequant: 9-bit state → codebook lookup
+// Core implementation takes explicit codebook pointer for SMEM/constant flexibility
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
-        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_turbo3_tcq_cb(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
     const block_turbo3_tcq * x = (const block_turbo3_tcq *) vx;
     const int64_t ib = i0 / QK_TURBO3_TCQ;
     const int     j0 = (int)(i0 % QK_TURBO3_TCQ);
@@ -1081,7 +1099,7 @@ static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
         const int bit_pos = t * 3;
         const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
         const int state = (raw >> (bit_pos % 8)) & 0x1FF;
-        vals[l] = d_turbo3_tcq_codebook_fattn[state] * norm;
+        vals[l] = cb[state] * norm;
     }
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
@@ -1094,10 +1112,18 @@ static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
-// TCQ 2-bit V dequant: 8-bit state from trellis bitstream → 256-entry codebook
+// Wrapper using __constant__ codebook (for function pointer dispatch via dequantize_V_t)
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo2_tcq(
+static __device__ __forceinline__ void dequantize_V_turbo3_tcq(
         const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    dequantize_V_turbo3_tcq_cb<T, ne>(vx, dst, i0, d_turbo3_tcq_codebook_fattn);
+}
+
+// TCQ 2-bit V dequant: 8-bit state → codebook lookup
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo2_tcq_cb(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
     const block_turbo2_tcq * x = (const block_turbo2_tcq *) vx;
     const int64_t ib = i0 / QK_TURBO2_TCQ;
     const int     j0 = (int)(i0 % QK_TURBO2_TCQ);
@@ -1110,7 +1136,7 @@ static __device__ __forceinline__ void dequantize_V_turbo2_tcq(
         const int bit_pos = t * 2;
         const uint16_t raw = (uint16_t)x[ib].qs[bit_pos/8] | ((uint16_t)x[ib].qs[bit_pos/8 + 1] << 8);
         const int state = (raw >> (bit_pos % 8)) & 0xFF;
-        vals[l] = d_turbo2_tcq_codebook_fattn[state] * norm;
+        vals[l] = cb[state] * norm;
     }
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
@@ -1121,6 +1147,13 @@ static __device__ __forceinline__ void dequantize_V_turbo2_tcq(
     if constexpr (std::is_same_v<T, float>) {
         for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
+// Wrapper using __constant__ codebook (for function pointer dispatch via dequantize_V_t)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo2_tcq(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    dequantize_V_turbo2_tcq_cb<T, ne>(vx, dst, i0, d_turbo2_tcq_codebook_fattn);
 }
 
 template <ggml_type type_K, int D, int nthreads>
