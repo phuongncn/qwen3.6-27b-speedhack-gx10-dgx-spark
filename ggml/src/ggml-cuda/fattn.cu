@@ -823,7 +823,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Allocate and dequant K to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_k) {
-        const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
+        // Size for full cache (kv_size from root) so we never realloc mid-session.
+        const ggml_tensor * k_root = K;
+        while (k_root->view_src) k_root = k_root->view_src;
+        const size_t k_size = (size_t)k_root->ne[0] * k_root->ne[1] * k_root->ne[2] * sizeof(half);
         if (k_size > kv_dequant_k_buf_size[device]) {
             if (kv_dequant_k_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device]));
             CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device], k_size));
@@ -890,7 +893,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
 
     // Allocate and dequant V to fp16 (turbo2, turbo3, or turbo4)
     if (turbo_v) {
-        const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
+        // Size for full cache (kv_size from root) so we never realloc mid-session.
+        const ggml_tensor * v_root = V;
+        while (v_root->view_src) v_root = v_root->view_src;
+        const size_t v_size = (size_t)v_root->ne[0] * v_root->ne[1] * v_root->ne[2] * sizeof(half);
         if (v_size > kv_dequant_v_buf_size[device]) {
             if (kv_dequant_v_buf[device]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device]));
             CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device], v_size));
@@ -1488,11 +1494,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
             const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
             if (k_needs_dequant) {
-                const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
-                if (k_size > kv_dequant_k_buf_size[device_dec]) {
+                // Size the dequant buffer for the FULL cache (kv_size from the underlying root
+                // tensor), not just the current n_kv. This prevents per-token reallocations as
+                // the cache fills, which would invalidate any in-flight CUDA graph capture
+                // pointing at the old device pointer (defensive against PR #21635-class bugs).
+                // The first call sizes the buffer for the worst-case cache; subsequent calls
+                // (including layers with smaller caches) reuse the same allocation.
+                const ggml_tensor * k_root = K;
+                while (k_root->view_src) k_root = k_root->view_src;
+                const size_t k_max_bytes = (size_t)k_root->ne[0] * k_root->ne[1] * k_root->ne[2] * sizeof(half);
+                if (k_max_bytes > kv_dequant_k_buf_size[device_dec]) {
                     if (kv_dequant_k_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_k_buf[device_dec]));
-                    CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device_dec], k_size));
-                    kv_dequant_k_buf_size[device_dec] = k_size;
+                    CUDA_CHECK(cudaMalloc(&kv_dequant_k_buf[device_dec], k_max_bytes));
+                    kv_dequant_k_buf_size[device_dec] = k_max_bytes;
                 }
                 k_fp16_dec = kv_dequant_k_buf[device_dec];
                 // K dequant to fp16 in ORIGINAL (unrotated) domain via inverse FWHT.
@@ -1552,11 +1566,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dst->src[1] = &K_f16_dec;
             }
             if (v_needs_dequant) {
-                const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
-                if (v_size > kv_dequant_v_buf_size[device_dec]) {
+                // Same kv_size-based sizing as K above — see comment there.
+                const ggml_tensor * v_root = V;
+                while (v_root->view_src) v_root = v_root->view_src;
+                const size_t v_max_bytes = (size_t)v_root->ne[0] * v_root->ne[1] * v_root->ne[2] * sizeof(half);
+                if (v_max_bytes > kv_dequant_v_buf_size[device_dec]) {
                     if (kv_dequant_v_buf[device_dec]) CUDA_CHECK(cudaFree(kv_dequant_v_buf[device_dec]));
-                    CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device_dec], v_size));
-                    kv_dequant_v_buf_size[device_dec] = v_size;
+                    CUDA_CHECK(cudaMalloc(&kv_dequant_v_buf[device_dec], v_max_bytes));
+                    kv_dequant_v_buf_size[device_dec] = v_max_bytes;
                 }
                 v_fp16_dec = kv_dequant_v_buf[device_dec];
                 // V dequant to fp16. All turbo V stays in rotated domain — the graph-level
