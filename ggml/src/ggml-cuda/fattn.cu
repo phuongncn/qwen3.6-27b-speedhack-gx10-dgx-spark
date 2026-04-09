@@ -6,6 +6,8 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+
 // InnerQ: update the fattn-side inverse scale array from host
 void turbo_innerq_update_fattn_scales(const float * scale_inv) {
     cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, scale_inv, 128 * sizeof(float));
@@ -1570,6 +1572,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 V_f16_dec.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
                 orig_v_decode = dst->src[2];
                 dst->src[2] = &V_f16_dec;
+                // Bug A1 (Blackwell sm_120a, nvcc 13): the host compiler reorders the
+                // V_f16_dec.nb[*] stride stores past the FA kernel dispatcher below, so the
+                // dispatched kernel reads stale (turbo cache) strides and emits garbage tokens
+                // (the infamous <unused49> output). A pure compiler-only barrier here pins the
+                // stride writes in source order. No machine instructions are emitted; this is a
+                // host-side reorder fence, not a hardware fence or GPU sync.
+                std::atomic_signal_fence(std::memory_order_seq_cst);
             }
         }
 
