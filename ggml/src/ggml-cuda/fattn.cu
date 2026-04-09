@@ -1572,12 +1572,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 V_f16_dec.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
                 orig_v_decode = dst->src[2];
                 dst->src[2] = &V_f16_dec;
-                // Bug A1 (Blackwell sm_120a, nvcc 13): the host compiler reorders the
-                // V_f16_dec.nb[*] stride stores past the FA kernel dispatcher below, so the
-                // dispatched kernel reads stale (turbo cache) strides and emits garbage tokens
-                // (the infamous <unused49> output). A pure compiler-only barrier here pins the
-                // stride writes in source order. No machine instructions are emitted; this is a
-                // host-side reorder fence, not a hardware fence or GPU sync.
+                // Bug A1: nvcc 13 on sm_120a reorders these V_f16_dec.nb[*] stores past the FA
+                // dispatcher → stale strides → <unused49> garbage. signal_fence is a pure
+                // host-compiler barrier (zero machine instructions).
                 std::atomic_signal_fence(std::memory_order_seq_cst);
             }
         }
