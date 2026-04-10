@@ -13,6 +13,43 @@
 #include <map>
 #include <stdexcept>
 
+// Turbo TCQ prompt cache safety: compute a fingerprint from the codebook env
+// vars so that loading a cache created with a different codebook is detected.
+// The fingerprint is a CRC32 of the codebook FILE CONTENTS (not the path),
+// so the check is relocatable — only the actual data matters.
+static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
+    if (!path || !path[0]) {
+        return 0; // no custom codebook → use compiled-in default → hash 0
+    }
+    uint32_t crc = 0xFFFFFFFF;
+    FILE * f = fopen(path, "rb");
+    if (!f) { return 0; }
+    float buf[512];
+    size_t n = fread(buf, sizeof(float), n_floats, f);
+    fclose(f);
+    if (n != n_floats) { return 0; }
+    const uint8_t * data = (const uint8_t *)buf;
+    for (size_t i = 0; i < n_floats * sizeof(float); i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+static uint32_t turbo_tcq_fingerprint(void) {
+    const char * cb3 = getenv("TURBO_TCQ_CB");
+    const char * cb2 = getenv("TURBO_TCQ_CB2");
+    uint32_t h3 = turbo_tcq_codebook_crc32(cb3, 512);
+    uint32_t h2 = turbo_tcq_codebook_crc32(cb2, 256);
+    return h3 ^ (h2 * 0x9E3779B9); // mix both hashes
+}
+
+static bool ggml_type_is_turbo_tcq(enum ggml_type t) {
+    return t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -2271,6 +2308,21 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             }
         }
     }
+
+    // Turbo TCQ safety footer: embed codebook fingerprint so loading a cache
+    // saved with a different TURBO_TCQ_CB/CB2 is detected at load time.
+    bool has_tcq = false;
+    for (const auto & layer : layers) {
+        if (ggml_type_is_turbo_tcq(layer.k_stream[cr.strm]->type)) { has_tcq = true; break; }
+        auto * v = layer.v_stream[cr.strm];
+        if (v && ggml_type_is_turbo_tcq(v->type)) { has_tcq = true; break; }
+    }
+    if (has_tcq) {
+        const uint32_t magic = 0x54514346; // "TQCF" — TurboQuant Cache Fingerprint
+        const uint32_t fp    = turbo_tcq_fingerprint();
+        io.write(&magic, sizeof(magic));
+        io.write(&fp,    sizeof(fp));
+    }
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
@@ -2558,6 +2610,34 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         }
+    }
+
+    // Turbo TCQ safety: verify codebook fingerprint matches current process.
+    bool has_tcq = false;
+    for (const auto & layer : layers) {
+        if (ggml_type_is_turbo_tcq(layer.k_stream[strm]->type)) { has_tcq = true; break; }
+        auto * v = layer.v_stream[strm];
+        if (v && ggml_type_is_turbo_tcq(v->type)) { has_tcq = true; break; }
+    }
+    if (has_tcq) {
+        uint32_t magic_ref = 0;
+        io.read_to(&magic_ref, sizeof(magic_ref));
+        if (magic_ref != 0x54514346) { // "TQCF"
+            LLAMA_LOG_ERROR("%s: turbo TCQ cache file missing codebook fingerprint — "
+                            "file may have been saved by an older build without TCQ safety checks\n", __func__);
+            return false;
+        }
+        uint32_t fp_ref = 0;
+        io.read_to(&fp_ref, sizeof(fp_ref));
+        const uint32_t fp_now = turbo_tcq_fingerprint();
+        if (fp_ref != fp_now) {
+            LLAMA_LOG_ERROR("%s: turbo TCQ codebook mismatch — cache was saved with fingerprint "
+                            "0x%08X but current TURBO_TCQ_CB/CB2 gives 0x%08X. "
+                            "Set the same codebook env vars as when the cache was created.\n",
+                            __func__, fp_ref, fp_now);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: turbo TCQ codebook fingerprint verified (0x%08X)\n", __func__, fp_ref);
     }
 
     return true;
