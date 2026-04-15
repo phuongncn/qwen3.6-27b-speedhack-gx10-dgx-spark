@@ -162,44 +162,20 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
+            auto & cell = cells[tail_id];
+            // partial intersection that includes the tail position
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                // for speculative decoding, find the best checkpoint to roll back to.
-                // search for the highest-position checkpoint at or below p0-1.
-                int32_t best_cell = -1;
-                llama_pos best_pos = -1;
-                for (uint32_t i = 0; i < size; ++i) {
-                    if ((int32_t)i != tail_id && cells[i].has_seq_id(seq_id) && cells[i].pos <= p0 - 1 && cells[i].pos > best_pos) {
-                        best_pos = cells[i].pos;
-                        best_cell = i;
-                    }
-                }
-
-                if (best_cell >= 0) {
-                    tail_id = best_cell;
-                } else {
-                    // No checkpoint found: SSM tensor state cannot be rolled back
-                    return false;
-                }
+                // For speculative decoding on hybrid models: keep the recurrent state data
+                // (which includes rejected draft tokens) but adjust the position to match
+                // what was accepted. The DeltaNet state corruption from extra tokens is
+                // minor compared to restoring from a checkpoint that misses accepted tokens.
+                cell.pos = p0 - 1;
+                return true;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 if (p0 == 0) {
                     tail_id = -1;
-                } else {
-                    // Search for the best remaining cell after removal
-                    int32_t new_tail = -1;
-                    llama_pos max_pos = -1;
-                    for (uint32_t i = 0; i < size; ++i) {
-                        if (cells[i].has_seq_id(seq_id) && cells[i].pos < p0) {
-                            if (cells[i].pos > max_pos) {
-                                max_pos = cells[i].pos;
-                                new_tail = i;
-                            }
-                        }
-                    }
-                    tail_id = new_tail;
                 }
             }
         }
@@ -641,35 +617,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
-                empty_cell.src = seq_meta.tail; // the data should be copied from the previous tail
-
-                // Copy state data
-                copy_cell(seq_meta.tail, next_empty_cell);
-
-                // Keep history of previous states for rollback (up to 8 cells per sequence)
-                if (get_cell_count(seq_id) < 8 && used < size * 0.9) {
-                    // Do not erase seq_id from orig_cell to keep it as a checkpoint
-                } else {
-                    // Erase oldest history point for this sequence
-                    int32_t oldest_cell = -1;
-                    llama_pos min_pos = std::numeric_limits<llama_pos>::max();
-                    for (uint32_t i = 0; i < size; ++i) {
-                        if (cells[i].has_seq_id(seq_id) && cells[i].pos < min_pos) {
-                            min_pos = cells[i].pos;
-                            oldest_cell = i;
-                        }
-                    }
-
-                    if (oldest_cell >= 0) {
-                        cells[oldest_cell].seq_id.erase(seq_id);
-                        if (cells[oldest_cell].is_empty()) {
-                            cells[oldest_cell].pos = -1;
-                            cells[oldest_cell].src = -1;
-                            used--;
-                        }
-                    }
+                empty_cell.src = seq_meta.tail;
+                orig_cell.seq_id.erase(seq_id);
+                if (orig_cell.is_empty()) {
+                    orig_cell.pos = -1;
+                    orig_cell.src = -1;
+                    used -= 1;
                 }
-                empty_cell.seq_id.insert(seq_id); // will be overwritten
+                empty_cell.seq_id.insert(seq_id);
             }
             seq_meta.tail = next_empty_cell;
             // find next empty cell
@@ -679,49 +634,6 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     if (next_empty_cell >= size) { next_empty_cell -= size; }
                     auto & cell = cells[next_empty_cell];
                     if (cell.is_empty()) { break; }
-                }
-            }
-        } else {
-            // Sequence owns its cell. Save a checkpoint of the current state before it is
-            // overwritten by new tokens. Required for speculative decoding rollback.
-            const int32_t cur_tail = seq_meta.tail;
-            if (cells[next_empty_cell].is_empty()) {
-                bool can_checkpoint = (get_cell_count(seq_id) < 8 && used < size * 0.9);
-                if (!can_checkpoint) {
-                    // Try to evict the oldest checkpoint to make room
-                    int32_t oldest = -1;
-                    llama_pos min_pos = std::numeric_limits<llama_pos>::max();
-                    for (uint32_t j = 0; j < size; ++j) {
-                        if ((int32_t)j != cur_tail && cells[j].has_seq_id(seq_id) && cells[j].pos < min_pos) {
-                            min_pos = cells[j].pos;
-                            oldest = j;
-                        }
-                    }
-                    if (oldest >= 0) {
-                        cells[oldest].seq_id.erase(seq_id);
-                        if (cells[oldest].is_empty()) {
-                            cells[oldest].pos = -1;
-                            cells[oldest].src = -1;
-                            used--;
-                        }
-                        can_checkpoint = true;
-                    }
-                }
-                if (can_checkpoint) {
-                    auto & cp_cell = cells[next_empty_cell];
-                    copy_cell(cur_tail, next_empty_cell);
-                    cp_cell.pos = cells[cur_tail].pos;
-                    cp_cell.src = next_empty_cell;
-                    cp_cell.seq_id.insert(seq_id);
-                    used++;
-                    // advance next_empty_cell for subsequent sequences in this batch
-                    if (s + 1 < n_seqs) {
-                        for (uint32_t j = 0; j < size; ++j) {
-                            next_empty_cell += 1;
-                            if (next_empty_cell >= size) { next_empty_cell -= size; }
-                            if (cells[next_empty_cell].is_empty()) { break; }
-                        }
-                    }
                 }
             }
         }
