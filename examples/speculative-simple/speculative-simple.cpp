@@ -117,6 +117,10 @@ int main(int argc, char ** argv) {
     // used to determine end of generation
     bool has_eos = false;
 
+    // hybrid models with recurrent layers need re-evaluation of accepted tokens
+    // after rejecting draft tokens, because the recurrent state cannot be rolled back
+    const bool needs_reeval = llama_model_is_recurrent(model_tgt);
+
     // ================================================
     // everything until here is standard initialization
     // the relevant stuff for speculative decoding starts here
@@ -227,9 +231,28 @@ int main(int argc, char ** argv) {
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
-        {
-            LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
+        if (needs_reeval && !draft.empty() && !has_eos) {
+            // For hybrid models: roll back everything from this batch (both KV cache
+            // and recurrent state), then re-decode only the accepted tokens so the
+            // recurrent state is correct. Without this, rejected draft tokens corrupt
+            // the recurrent (DeltaNet/SSM) state which cannot be rolled back.
+            const int n_past_before = n_past - (int)ids.size(); // position where id_last was placed
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past_before, -1);
 
+            // Re-decode the accepted tokens that were pushed to prompt_tgt.
+            // Don't include id_last — it'll be decoded at the start of the next iteration.
+            common_batch_clear(batch_tgt);
+            for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
+                common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
+            }
+
+            if (batch_tgt.n_tokens > 0) {
+                llama_decode(ctx_tgt, batch_tgt);
+            }
+            // n_past = prompt_tgt.size(), id_last will go at this position next iteration
+            n_past = (int)prompt_tgt.size();
+        } else {
+            LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
 
