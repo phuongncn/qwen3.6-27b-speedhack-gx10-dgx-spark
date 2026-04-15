@@ -177,6 +177,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -329,6 +330,13 @@ struct common_params_speculative {
 
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
+
+    // suffix tree speculative decoding
+
+    int32_t suffix_max_depth    = 64;   // maximum depth of suffix tree
+    float   suffix_spec_factor  = 2.0f; // max_spec = factor * match_len + offset
+    float   suffix_spec_offset  = 0.0f; // additive offset for max speculative tokens
+    float   suffix_min_prob     = 0.1f; // prune branches below this probability
 
     // draft-model speculative decoding
 
