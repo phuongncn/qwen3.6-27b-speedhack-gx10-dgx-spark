@@ -25,7 +25,7 @@ public:
                      uint32_t   n_seq_max,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -112,6 +112,9 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    // backend used for async D2D tensor copies (avoids per-copy sync)
+    ggml_backend_t copy_backend = nullptr;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

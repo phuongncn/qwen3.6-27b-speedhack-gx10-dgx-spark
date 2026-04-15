@@ -109,6 +109,18 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
         ggml_backend_buffer_clear(buf, 0);
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        // create a backend for async D2D copies (one sync instead of per-tensor sync)
+        if (!copy_backend) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev) {
+                copy_backend = ggml_backend_dev_init(dev, NULL);
+                if (copy_backend) {
+                    LLAMA_LOG_INFO("%s: async copy backend: %s\n", __func__, ggml_backend_name(copy_backend));
+                }
+            }
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -120,6 +132,12 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
+    }
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    if (copy_backend) {
+        ggml_backend_free(copy_backend);
     }
 }
 
@@ -397,8 +415,10 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
+    const bool use_async = (copy_backend != nullptr);
+
     // create one shared ggml context for all view pairs
-    const uint32_t n_recur = hparams.n_layer; // overcount is fine, just allocates more overhead
+    const uint32_t n_recur = hparams.n_layer;
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(4 * n_recur * ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
@@ -414,7 +434,11 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], n_embd, i_dst * row_bytes);
             src_v->buffer = r_l[il]->buffer;
             dst_v->buffer = r_l[il]->buffer;
-            ggml_backend_tensor_copy(src_v, dst_v);
+            if (use_async) {
+                ggml_backend_tensor_copy_async(copy_backend, copy_backend, src_v, dst_v);
+            } else {
+                ggml_backend_tensor_copy(src_v, dst_v);
+            }
         }
         if (s_l[il]) {
             const uint32_t n_embd = hparams.n_embd_s();
@@ -423,8 +447,17 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], n_embd, i_dst * row_bytes);
             src_v->buffer = s_l[il]->buffer;
             dst_v->buffer = s_l[il]->buffer;
-            ggml_backend_tensor_copy(src_v, dst_v);
+            if (use_async) {
+                ggml_backend_tensor_copy_async(copy_backend, copy_backend, src_v, dst_v);
+            } else {
+                ggml_backend_tensor_copy(src_v, dst_v);
+            }
         }
+    }
+
+    // single sync point for all async copies
+    if (use_async) {
+        ggml_backend_synchronize(copy_backend);
     }
 
     ggml_free(ctx);
