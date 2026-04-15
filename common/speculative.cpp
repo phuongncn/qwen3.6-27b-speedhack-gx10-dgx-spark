@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -27,7 +28,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
-    COMMON_SPECULATIVE_TYPE_SUFFIX
+    COMMON_SPECULATIVE_TYPE_SUFFIX,
+    COMMON_SPECULATIVE_TYPE_COPYSPEC
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -39,7 +41,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
-    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
+    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
+    {"copyspec",      COMMON_SPECULATIVE_TYPE_COPYSPEC}
 };
 
 struct common_speculative_config {
@@ -817,9 +820,110 @@ struct common_speculative_state_suffix : public common_speculative_state {
     }
 };
 
+// CopySpec: draft by copying matching subsequences from the prompt context.
+// Builds a rolling-hash index of all gamma-length windows in the prompt.
+// On each draft call, hashes the last gamma tokens of output and looks up matches.
+struct common_speculative_state_copyspec : public common_speculative_state {
+    static constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+    static constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
+
+    int32_t gamma; // window size for matching
+
+    // hash of gamma-length window -> position after the window in the prompt
+    std::unordered_multimap<uint64_t, int32_t> index;
+    llama_tokens prompt_tokens;
+
+    common_speculative_state_copyspec(enum common_speculative_type type, int32_t gamma)
+        : common_speculative_state(type)
+        , gamma(gamma)
+    {}
+
+    static uint64_t hash_window(const llama_token * tokens, int32_t len) {
+        uint64_t h = FNV_OFFSET;
+        for (int32_t i = 0; i < len; i++) {
+            h ^= (uint64_t)(uint32_t)tokens[i];
+            h *= FNV_PRIME;
+        }
+        return h;
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        index.clear();
+        prompt_tokens = prompt;
+        if ((int32_t)prompt.size() <= gamma) {
+            return;
+        }
+        for (int32_t i = 0; i <= (int32_t)prompt.size() - gamma; i++) {
+            uint64_t h = hash_window(prompt.data() + i, gamma);
+            index.emplace(h, i + gamma);
+        }
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        // build the full context (prompt_tgt + id_last)
+        const int32_t ctx_len = (int32_t)prompt_tgt.size() + 1;
+        if (ctx_len < gamma) {
+            return;
+        }
+
+        // hash the last gamma tokens of context
+        std::vector<llama_token> window(gamma);
+        const int32_t start = ctx_len - gamma;
+        for (int32_t i = 0; i < gamma; i++) {
+            const int32_t pos = start + i;
+            window[i] = (pos < (int32_t)prompt_tgt.size()) ? prompt_tgt[pos] : id_last;
+        }
+        uint64_t h = hash_window(window.data(), gamma);
+
+        // find longest match in prompt
+        int32_t best_pos = -1;
+        int32_t best_len = 0;
+        auto range = index.equal_range(h);
+        for (auto it = range.first; it != range.second; ++it) {
+            int32_t pos = it->second;
+            // verify hash match (collision check)
+            if (pos < gamma || pos > (int32_t)prompt_tokens.size()) {
+                continue;
+            }
+            bool match = true;
+            for (int32_t j = 0; j < gamma; j++) {
+                if (prompt_tokens[pos - gamma + j] != window[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+            // count how many tokens we can copy from this position
+            int32_t avail = std::min(params.n_max, (int32_t)prompt_tokens.size() - pos);
+            if (avail > best_len) {
+                best_len = avail;
+                best_pos = pos;
+            }
+        }
+
+        if (best_pos < 0) {
+            return;
+        }
+
+        for (int32_t i = 0; i < best_len; i++) {
+            result.push_back(prompt_tokens[best_pos + i]);
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+};
+
 struct common_speculative {
-    std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
-    common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
+    std::vector<std::unique_ptr<common_speculative_state>> impls;
+    common_speculative_state * curr_impl = nullptr;
 };
 
 static common_ngram_map get_common_ngram_map(const common_speculative_config & config) {
@@ -866,6 +970,8 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_SUFFIX:        return "suffix";
+        case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
         default:                                    return "unknown";
     }
 }
@@ -940,6 +1046,7 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         bool has_suffix        = (params.type == COMMON_SPECULATIVE_TYPE_SUFFIX);
+        bool has_copyspec      = (params.type == COMMON_SPECULATIVE_TYPE_COPYSPEC);
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -972,6 +1079,9 @@ common_speculative * common_speculative_init(
         }
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_copyspec) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
         }
         if (has_suffix) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
@@ -1051,6 +1161,15 @@ common_speculative * common_speculative_init(
                 LOG_INF("%s: suffix tree speculative decoding (max_depth=%d, factor=%.1f, min_prob=%.2f)\n",
                     __func__, config.params.suffix_max_depth,
                     config.params.suffix_spec_factor, config.params.suffix_min_prob);
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_COPYSPEC: {
+                impls.push_back(std::make_unique<common_speculative_state_copyspec>(
+                    config.type,
+                    config.params.copyspec_gamma
+                ));
+                LOG_INF("%s: copyspec speculative decoding (gamma=%d)\n",
+                    __func__, config.params.copyspec_gamma);
                 break;
             }
             default:

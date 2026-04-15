@@ -33,7 +33,8 @@ int main(int argc, char ** argv) {
             params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
             params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
             params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_SUFFIX) {
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_SUFFIX &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_COPYSPEC) {
         LOG_ERR("%s: --model-draft is required (unless using a model-free --spec-type)\n", __func__);
         return 1;
     }
