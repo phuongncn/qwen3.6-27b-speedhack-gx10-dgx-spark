@@ -157,17 +157,27 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
-    while (true) {
-        // optionally, generate draft tokens that can be appended to the target batch
-        //
-        // this is the most important part of the speculation. the more probable tokens that are provided here
-        // the better the performance will be. in theory, this computation can be performed asynchronously and even
-        // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
-        // from a cache or lookup tables.
-        //
-        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+    // timing accumulators (microseconds)
+    int64_t t_draft_total   = 0;  // suffix tree draft generation
+    int64_t t_backup_total  = 0;  // copy_cell backup
+    int64_t t_decode1_total = 0;  // main verification decode
+    int64_t t_sample_total  = 0;  // sampling
+    int64_t t_restore_total = 0;  // seq_rm + seq_cp restore
+    int64_t t_decode2_total = 0;  // re-evaluation decode
+    int64_t t_other_total   = 0;  // everything else (token output, bookkeeping)
+    int     n_iters         = 0;
+    int     n_reeval_tokens = 0;  // total tokens re-evaluated
+    int     n_reeval_calls  = 0;  // number of re-eval decode calls
+    int     n_reeval_skipped = 0; // iterations where all drafts accepted (no re-eval needed)
 
-        //LOG_DBG("draft: %s\n", string_from(ctx_dft, draft).c_str());
+    while (true) {
+        int64_t t0, t1;
+        n_iters++;
+
+        t0 = ggml_time_us();
+        llama_tokens draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+        t1 = ggml_time_us();
+        t_draft_total += (t1 - t0);
 
         // always have a token to evaluate from before - id_last
         common_batch_clear(batch_tgt);
@@ -185,31 +195,29 @@ int main(int argc, char ** argv) {
             // For hybrid models: save recurrent state before adding draft tokens
             // so we can restore it after rejection
             if (needs_reeval && !draft.empty()) {
+                t0 = ggml_time_us();
                 auto * mem = llama_get_memory(ctx_tgt);
                 llama_memory_seq_rm(mem, seq_backup, -1, -1);
                 llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
                 has_backup = true;
+                t1 = ggml_time_us();
+                t_backup_total += (t1 - t0);
             }
 
             for (size_t i = 0; i < draft.size(); ++i) {
                 common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
             }
 
-            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
-
+            t0 = ggml_time_us();
             llama_decode(ctx_tgt, batch_tgt);
+            t1 = ggml_time_us();
+            t_decode1_total += (t1 - t0);
         }
 
-        // sample from the full target batch and return the accepted tokens based on the target sampler
-        //
-        // for each token to be accepted, the sampler would have to sample that same token
-        // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
-        // available logits from the batch and sample the next token until we run out of logits or the sampler
-        // disagrees with the draft
-        //
+        t0 = ggml_time_us();
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
-
-        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
+        t1 = ggml_time_us();
+        t_sample_total += (t1 - t0);
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
 
@@ -218,11 +226,7 @@ int main(int argc, char ** argv) {
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
 
-        // process the accepted tokens and update contexts
-        //
-        // this is the standard token post-processing that we normally do
-        // in this case, we do it for a group of accepted tokens at once
-        //
+        t0 = ggml_time_us();
         for (size_t i = 0; i < ids.size(); ++i) {
             prompt_tgt.push_back(id_last);
 
@@ -241,34 +245,48 @@ int main(int argc, char ** argv) {
                 LOG("%s", token_str.c_str());
             }
         }
+        t1 = ggml_time_us();
+        t_other_total += (t1 - t0);
 
         LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
         if (has_backup && !has_eos) {
-            // For hybrid models: restore recurrent state from backup (before the
-            // speculative batch), remove attention KV entries from the batch, then
-            // re-decode accepted tokens to get correct recurrent state.
-            auto * mem = llama_get_memory(ctx_tgt);
-            const int n_past_before = n_past - (int)ids.size(); // position where id_last was placed
+            const bool all_accepted = (ids.size() == draft.size() + 1);
 
-            // Remove all entries from batch start for seq 0
-            llama_memory_seq_rm(mem, 0, n_past_before, -1);
+            if (all_accepted) {
+                // All draft tokens accepted — recurrent state is already correct
+                // from the verification decode. Skip expensive restore+re-decode.
+                auto * mem = llama_get_memory(ctx_tgt);
+                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                llama_memory_seq_rm(mem, 0, n_past, -1);
+                n_reeval_skipped++;
+            } else {
+                // Partial rejection — must restore backup and re-decode accepted tokens.
+                t0 = ggml_time_us();
+                auto * mem = llama_get_memory(ctx_tgt);
+                const int n_past_before = n_past - (int)ids.size();
 
-            // Restore recurrent state from backup
-            llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
-            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                llama_memory_seq_rm(mem, 0, n_past_before, -1);
+                llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
+                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                t1 = ggml_time_us();
+                t_restore_total += (t1 - t0);
 
-            // Re-decode accepted tokens with clean recurrent state.
-            // Don't include id_last — it'll be decoded at the start of the next iteration.
-            common_batch_clear(batch_tgt);
-            for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
-                common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
+                common_batch_clear(batch_tgt);
+                for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
+                    common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
+                }
+
+                if (batch_tgt.n_tokens > 0) {
+                    t0 = ggml_time_us();
+                    llama_decode(ctx_tgt, batch_tgt);
+                    t1 = ggml_time_us();
+                    t_decode2_total += (t1 - t0);
+                    n_reeval_tokens += batch_tgt.n_tokens;
+                    n_reeval_calls++;
+                }
+                n_past = (int)prompt_tgt.size();
             }
-
-            if (batch_tgt.n_tokens > 0) {
-                llama_decode(ctx_tgt, batch_tgt);
-            }
-            n_past = (int)prompt_tgt.size();
         } else {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
@@ -280,6 +298,23 @@ int main(int argc, char ** argv) {
     }
 
     auto t_dec_end = ggml_time_us();
+
+    const int64_t t_dec_total = t_dec_end - t_dec_start;
+    const int64_t t_accounted = t_draft_total + t_backup_total + t_decode1_total + t_sample_total + t_restore_total + t_decode2_total + t_other_total;
+
+    LOG_INF("\n");
+    LOG_INF("=== SPECULATIVE LOOP TIMING BREAKDOWN ===\n");
+    LOG_INF("iterations:     %d\n", n_iters);
+    LOG_INF("total decode:   %8.2f ms (100%%)\n", t_dec_total / 1e3);
+    LOG_INF("  draft gen:    %8.2f ms (%5.1f%%)\n", t_draft_total / 1e3,   100.0 * t_draft_total / t_dec_total);
+    LOG_INF("  backup:       %8.2f ms (%5.1f%%)\n", t_backup_total / 1e3,  100.0 * t_backup_total / t_dec_total);
+    LOG_INF("  decode1 (verify): %8.2f ms (%5.1f%%)  [%d tok/call avg]\n", t_decode1_total / 1e3, 100.0 * t_decode1_total / t_dec_total, n_iters > 0 ? (int)(n_predict + n_drafted) / n_iters : 0);
+    LOG_INF("  sampling:     %8.2f ms (%5.1f%%)\n", t_sample_total / 1e3,  100.0 * t_sample_total / t_dec_total);
+    LOG_INF("  restore:      %8.2f ms (%5.1f%%)\n", t_restore_total / 1e3, 100.0 * t_restore_total / t_dec_total);
+    LOG_INF("  decode2 (reeval): %8.2f ms (%5.1f%%)  [%d calls, %d tok total, %.1f tok/call avg, %d skipped (all-accept)]\n", t_decode2_total / 1e3, 100.0 * t_decode2_total / t_dec_total, n_reeval_calls, n_reeval_tokens, n_reeval_calls > 0 ? (float)n_reeval_tokens / n_reeval_calls : 0.0f, n_reeval_skipped);
+    LOG_INF("  other:        %8.2f ms (%5.1f%%)\n", t_other_total / 1e3,   100.0 * t_other_total / t_dec_total);
+    LOG_INF("  unaccounted:  %8.2f ms (%5.1f%%)\n", (t_dec_total - t_accounted) / 1e3, 100.0 * (t_dec_total - t_accounted) / t_dec_total);
+    LOG_INF("=========================================\n");
 
     const int n_input = inp.size();
 

@@ -164,6 +164,10 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // Hybrid model: recurrent state backup for speculative decoding
+    bool has_draft_backup = false;
+    int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -565,6 +569,11 @@ private:
 
     bool add_bos_token = true;
 
+    // hybrid/recurrent models need re-evaluation of accepted tokens after
+    // rejecting draft tokens, because the recurrent state cannot be rolled back
+    bool needs_reeval = false;
+    int  n_parallel_actual = 0; // user-requested n_parallel (before bump for backup slots)
+
     int32_t n_ctx; // total context for all clients / slots
 
     // slots / clients
@@ -639,7 +648,20 @@ private:
 
         params_base = params;
 
+        // For hybrid/recurrent models with speculative decoding, we need extra
+        // sequence slots for backing up recurrent state (one per active slot).
+        // We add n_parallel extra slots so each slot i can use backup seq_id = i + n_parallel.
+        n_parallel_actual = params_base.n_parallel;
+        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+            params_base.n_parallel = n_parallel_actual * 2;
+            SRV_INF("speculative decoding: bumping n_seq_max from %d to %d for recurrent state backup\n",
+                    n_parallel_actual, params_base.n_parallel);
+        }
+
         llama_init = common_init_from_params(params_base);
+
+        // Restore n_parallel so only n_parallel_actual slots are created
+        params_base.n_parallel = n_parallel_actual;
 
         model = llama_init->model();
         ctx   = llama_init->context();
@@ -650,6 +672,8 @@ private:
         }
 
         vocab = llama_model_get_vocab(model);
+
+        needs_reeval = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
 
         n_ctx = llama_n_ctx(ctx);
 
@@ -2116,6 +2140,9 @@ private:
                     draft.resize(n_draft_max);
                 }
 
+                // save position before sampled token — needed for hybrid re-eval
+                slot.n_tokens_before_draft = slot.prompt.n_tokens();
+
                 // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2130,6 +2157,17 @@ private:
                 } else {
                     // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
+
+                    // For hybrid/recurrent models: backup recurrent state before draft tokens
+                    // so we can restore it after rejection
+                    if (needs_reeval) {
+                        // Each slot i uses backup seq_id = i + n_parallel_actual
+                        const llama_seq_id seq_backup = slot.id + n_parallel_actual;
+                        auto * mem = llama_get_memory(ctx);
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
+                        slot.has_draft_backup = true;
+                    }
 
                     // add all drafted tokens to the batch
                     for (size_t i = 0; i < draft.size(); i++) {
@@ -2934,7 +2972,39 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                if (slot.has_draft_backup) {
+                    const llama_seq_id seq_backup = slot.id + n_parallel_actual;
+                    auto * mem = llama_get_memory(ctx);
+                    const bool all_accepted = (ids.size() == n_draft + 1);
+
+                    if (all_accepted) {
+                        // All draft tokens accepted — recurrent state is already correct.
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                    } else {
+                        // Partial rejection — restore backup and re-decode accepted tokens.
+                        const int n_past_before = slot.n_tokens_before_draft;
+
+                        llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
+                        llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
+                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+                        const int n_reeval = slot.prompt.n_tokens() - n_past_before;
+                        if (n_reeval > 0) {
+                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                            const auto & toks = slot.prompt.tokens.get_text_tokens();
+                            for (int j = n_past_before; j < slot.prompt.n_tokens(); ++j) {
+                                common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                            }
+                            llama_decode(ctx, batch_reeval);
+                            llama_batch_free(batch_reeval);
+                        }
+                    }
+
+                    slot.has_draft_backup = false;
+                } else {
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
