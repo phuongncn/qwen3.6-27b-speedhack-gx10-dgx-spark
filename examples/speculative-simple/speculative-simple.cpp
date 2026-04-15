@@ -219,6 +219,14 @@ int main(int argc, char ** argv) {
 
         GGML_ASSERT(ids.size() > 0);
 
+        // update draft strategies with logits (e.g. token recycling adjacency matrix)
+        {
+            llama_tokens batch_tokens;
+            batch_tokens.push_back(id_last);
+            batch_tokens.insert(batch_tokens.end(), draft.begin(), draft.end());
+            common_speculative_update_logits(spec, ctx_tgt, batch_tokens, (int)ids.size());
+        }
+
         n_past    += ids.size() - 1;
         n_drafted += draft.size();
         n_accept  += ids.size() - 1;

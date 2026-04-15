@@ -11,6 +11,7 @@
 #include "suffix-tree.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -150,6 +151,11 @@ struct common_speculative_state {
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    // called after verification decode with logits still in ctx
+    // batch_tokens: tokens that were in the batch [id_last, draft0, draft1, ...]
+    // n_accepted: how many were accepted (ids.size(), including the bonus token)
+    virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -924,27 +930,53 @@ struct common_speculative_state_copyspec : public common_speculative_state {
 };
 
 // Token Recycling: adjacency matrix tracking top-k successors per token.
-// Updated from observed bigrams in prompt and generated text.
-// Drafts by greedy walk through the adjacency matrix.
+// Seeded from observed bigrams, then updated from model logits after each
+// verification decode. Logit-based entries have much higher scores and
+// dominate the adjacency matrix after the first few iterations.
 struct common_speculative_state_recycle : public common_speculative_state {
     int32_t k; // top-k successors per token
 
-    // adjacency: token -> vector of (count, successor) pairs, sorted by count descending
-    std::unordered_map<llama_token, std::vector<std::pair<uint32_t, llama_token>>> adj;
+    // adjacency: token -> vector of (score, successor) pairs, sorted by score descending
+    // scores: bigram observations use small integer counts (1, 2, ...),
+    //         logit-derived entries use logit values (typically 10-30+ for top tokens)
+    std::unordered_map<llama_token, std::vector<std::pair<float, llama_token>>> adj;
 
-    size_t n_fed = 0; // tokens already fed to adjacency matrix
+    size_t n_fed = 0;
+    int32_t n_vocab = 0;
 
     common_speculative_state_recycle(enum common_speculative_type type, int32_t k)
         : common_speculative_state(type)
         , k(k)
     {}
 
+    void set_successors(llama_token tok, const float * logits, int32_t vocab_size) {
+        // partial sort to find top-k logits
+        std::vector<std::pair<float, llama_token>> top(k, std::make_pair(-INFINITY, (llama_token)-1));
+        for (int32_t i = 0; i < vocab_size; i++) {
+            if (logits[i] > top[k-1].first) {
+                top[k-1] = std::make_pair(logits[i], (llama_token)i);
+                // bubble up
+                for (int32_t j = k-2; j >= 0; j--) {
+                    if (top[j+1].first > top[j].first) {
+                        std::swap(top[j], top[j+1]);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // remove unfilled slots
+        while (!top.empty() && top.back().second < 0) {
+            top.pop_back();
+        }
+        adj[tok] = std::move(top);
+    }
+
     void add_bigram(llama_token a, llama_token b) {
         auto & succs = adj[a];
         for (size_t i = 0; i < succs.size(); i++) {
             if (succs[i].second == b) {
-                succs[i].first++;
-                // bubble up to maintain sorted order
+                succs[i].first += 1.0f;
                 while (i > 0 && succs[i].first > succs[i-1].first) {
                     std::swap(succs[i], succs[i-1]);
                     i--;
@@ -952,11 +984,8 @@ struct common_speculative_state_recycle : public common_speculative_state {
                 return;
             }
         }
-        // new successor — insert if room, or replace least frequent
         if ((int32_t)succs.size() < k) {
-            succs.push_back({1, b});
-        } else if (succs.back().first <= 1) {
-            succs.back() = {1, b};
+            succs.push_back(std::make_pair(1.0f, b));
         }
     }
 
@@ -974,10 +1003,9 @@ struct common_speculative_state_recycle : public common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & result) override {
-        // feed new tokens
+        // feed new bigrams from generated tokens
         if (n_fed < prompt_tgt.size() + 1) {
             size_t start = (n_fed > 0) ? n_fed - 1 : 0;
-            // build full sequence including id_last
             for (size_t i = start; i < prompt_tgt.size(); i++) {
                 llama_token next = (i + 1 < prompt_tgt.size()) ? prompt_tgt[i + 1] : id_last;
                 add_bigram(prompt_tgt[i], next);
@@ -992,13 +1020,29 @@ struct common_speculative_state_recycle : public common_speculative_state {
             if (it == adj.end() || it->second.empty()) {
                 break;
             }
-            cur = it->second[0].second; // most frequent successor
+            cur = it->second[0].second;
             result.push_back(cur);
         }
     }
 
     void accept(uint16_t n_accepted) override {
         GGML_UNUSED(n_accepted);
+    }
+
+    void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
+        if (n_vocab == 0) {
+            const llama_model * model = llama_get_model(ctx);
+            n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        }
+        // update adjacency from logits for each position that had logits computed
+        // batch_tokens[i] is the token at position i; logits at i predict its successor
+        const int n_positions = std::min(n_accepted, (int)batch_tokens.size());
+        for (int i = 0; i < n_positions; i++) {
+            const float * logits = llama_get_logits_ith(ctx, i);
+            if (logits) {
+                set_successors(batch_tokens[i], logits, n_vocab);
+            }
+        }
     }
 };
 
@@ -1354,6 +1398,15 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
 
         impl->accept(n_accepted);
         impl->n_call_accept++;
+    }
+}
+
+void common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->update_logits(ctx, batch_tokens, n_accepted);
     }
 }
 
