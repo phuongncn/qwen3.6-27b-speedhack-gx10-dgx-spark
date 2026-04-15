@@ -27,8 +27,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.speculative.mparams_dft.path.empty()) {
-        LOG_ERR("%s: --model-draft is required\n", __func__);
+    if (params.speculative.mparams_dft.path.empty() &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_SUFFIX) {
+        LOG_ERR("%s: --model-draft is required (unless using a model-free --spec-type)\n", __func__);
         return 1;
     }
 
@@ -48,11 +54,10 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
-    // load the draft model
+    // load the draft model (skip for model-free spec types)
     llama_model_ptr model_dft;
 
-    // TODO: simplify this logic
-    {
+    if (!params.speculative.mparams_dft.path.empty()) {
         const auto & params_spec = params.speculative;
 
         auto params_dft = params;
