@@ -71,7 +71,8 @@ int main(int argc, char ** argv) {
 
         params_dft.n_parallel   = 1;
         params_dft.n_ctx        = params_spec.n_ctx;
-        params_dft.n_batch      = llama_n_ctx_seq(ctx_tgt);
+        // drafter only processes block_size tokens per call — keep batch small to save VRAM
+        params_dft.n_batch      = std::min((int32_t)64, params_spec.n_ctx > 0 ? params_spec.n_ctx : (int32_t)llama_n_ctx_seq(ctx_tgt));
         params_dft.devices      = params_spec.devices;
         params_dft.model        = params_spec.mparams_dft;
         params_dft.n_gpu_layers = params_spec.n_gpu_layers;
