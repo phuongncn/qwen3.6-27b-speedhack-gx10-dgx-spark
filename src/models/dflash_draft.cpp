@@ -103,6 +103,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // --- Embedding ---
     // tok_embd/output may be nullptr during graph reservation (shared from target at runtime)
+    // use F16 placeholder to reduce compute buffer (actual tensors are quantized, even smaller)
     ggml_tensor * tok_embd_use = model.tok_embd;
     if (!tok_embd_use) {
         tok_embd_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, model.vocab.n_tokens());
