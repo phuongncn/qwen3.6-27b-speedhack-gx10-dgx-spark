@@ -999,6 +999,11 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             return true;
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
+            // with GPU tape, only intercept qkv_mixed (others captured by graph)
+            if (cap->tape_gpu) {
+                auto it = cap->tape_name_map.find(t->name);
+                return (it != cap->tape_name_map.end() && it->second.second == DFLASH_TAPE_QKV);
+            }
             return true;
         }
         return false;
@@ -1023,7 +1028,12 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             int type      = it->second.second;
             auto & tape   = cap->tape_layers[layer_idx];
 
-            // total elements in this tensor
+            // when GPU tape is active, k/v/gate/beta are captured by graph-embedded copies
+            // only qkv_mixed still needs eval callback (for CPU-side conv state rebuild)
+            if (cap->tape_gpu && type != DFLASH_TAPE_QKV) {
+                return true; // skip — already on GPU
+            }
+
             size_t n_elem = ggml_nelements(t);
 
             switch (type) {
@@ -1046,6 +1056,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                     break;
                 case DFLASH_TAPE_QKV:
                     tape.conv_channels = t->ne[0];
+                    tape.n_tokens = (int) t->ne[1]; // also track token count for conv rebuild
                     dflash_read_tensor(t, tape.qkv_mixed, n_elem);
                     break;
             }
@@ -1108,11 +1119,93 @@ void llama_context::set_tape_recording(bool enable) {
             }
         }
         dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
+
+        // allocate GPU-resident tape buffer (graph writes directly, no eval callback sync)
+        allocate_tape_gpu(20); // max 20 tokens per verify batch (16 draft + a few extra)
     }
+
+    // expose to graph builder via cparams
+    cparams.tape_gpu = (enable && dflash_capture->tape_gpu) ? dflash_capture->tape_gpu.get() : nullptr;
+}
+
+void llama_context::allocate_tape_gpu(int max_tokens) {
+    if (!dflash_capture || dflash_capture->recurrent_layer_ids.empty()) {
+        return;
+    }
+
+    // find GPU backend
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        auto * dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+    if (!gpu_backend) {
+        return; // no GPU, fall back to CPU tape via eval callback
+    }
+
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    const int n_rec = (int) rec_ids.size();
+
+    // DeltaNet dimensions
+    // k shape at capture: [ssm_d_state, H_k, n_tokens] where H_k depends on fused GDN
+    // v/gate/beta shape: [S, H_v, n_tokens] or [1, H_v, n_tokens]
+    const int64_t S = hparams.ssm_d_state;     // 256 for Qwen3.5-27B
+    const int64_t H_v = hparams.ssm_dt_rank;   // 8 (num_v_heads)
+    // when fused GDN is active, k is NOT repeated (kernel handles GQA internally)
+    const int64_t H_k = (cparams.fused_gdn_ar && cparams.fused_gdn_ch)
+                       ? (int64_t) hparams.ssm_n_group   // 1 (not repeated)
+                       : H_v;                             // 8 (repeated)
+
+    // allocate ggml context for tensor descriptors
+    size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
+    struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+    struct ggml_context * tape_ctx = ggml_init(ctx_params);
+
+    auto tape = std::make_unique<dflash_tape_gpu>();
+    tape->layers.resize(n_rec);
+    tape->layer_ids = dflash_capture->recurrent_layer_ids;
+    tape->max_tokens = max_tokens;
+    tape->ctx = tape_ctx;
+
+    // create tensor descriptors
+    for (int li = 0; li < n_rec; ++li) {
+        auto & tl = tape->layers[li];
+        tl.k    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_k, (int64_t)max_tokens);
+        tl.v    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_v, (int64_t)max_tokens);
+        tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+        tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+    }
+
+    // allocate a single GPU buffer for all tape tensors
+    tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
+
+    if (!tape->buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer, falling back to CPU tape\n", __func__);
+        ggml_free(tape_ctx);
+        return;
+    }
+
+    size_t buf_size = ggml_backend_buffer_get_size(tape->buf);
+    LLAMA_LOG_INFO("%s: allocated GPU tape buffer: %.1f MB (%d layers, %d max tokens)\n",
+        __func__, buf_size / (1024.0 * 1024.0), n_rec, max_tokens);
+
+    dflash_capture->tape_gpu = std::move(tape);
 }
 
 void llama_context::tape_replay(int n_accepted) {
-    if (!dflash_capture || dflash_capture->tape_layers.empty() || n_accepted <= 0) {
+    if (!dflash_capture || n_accepted <= 0) {
+        return;
+    }
+
+    // GPU-resident tape path: data already on GPU from graph-embedded copies
+    const bool use_gpu_tape = (dflash_capture->tape_gpu != nullptr &&
+                               n_accepted <= dflash_capture->tape_gpu->max_tokens);
+
+    if (!use_gpu_tape && dflash_capture->tape_layers.empty()) {
         return;
     }
 
@@ -1159,32 +1252,23 @@ void llama_context::tape_replay(int n_accepted) {
     }
 
     if (!gpu_backend) {
-        // no GPU — fall back to CPU replay
         tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
         return;
     }
 
     // GPU tape replay: build a ggml graph with GDN ops for all recurrent layers
-    // State is accessed via views of s_l[il] (zero-copy on GPU).
-    // Only tape data (~24MB) is uploaded CPU→GPU.
-
-    // count valid layers for context sizing
-    int n_valid = 0;
-    for (size_t li = 0; li < rec_ids.size(); ++li) {
-        auto & tape = tape_layers[li];
-        if (tape.n_tokens > 0 && n_accepted <= tape.n_tokens) n_valid++;
-    }
-    if (n_valid == 0) goto conv_rebuild;
+    const int n_rec = (int) rec_ids.size();
+    if (n_rec == 0) goto conv_rebuild;
 
     {
-        // per layer: q,k,v,g,b inputs + s_view + b_sigmoid + result(GDN) + result_state + s_write + cpy = ~11 tensors
-        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_valid * 14 + 4) + ggml_graph_overhead_custom(n_valid * 12, false);
+        // per layer: k_view + v_view + g_view + b_view + q + b_sigmoid + s_view + GDN + result_state + s_write + cpy = ~11 tensors
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * 14 + 4) + ggml_graph_overhead_custom(n_rec * 12, false);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * ctx = ggml_init(ctx_params);
 
-        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_valid * 12, false);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 12, false);
 
-        // track inputs for data upload after allocation
+        // track Q tensors that need zeroing (only when NOT using GPU tape for k/v/g/b)
         struct replay_input {
             ggml_tensor * q;
             ggml_tensor * k;
@@ -1194,28 +1278,53 @@ void llama_context::tape_replay(int n_accepted) {
             size_t tape_li;
         };
         std::vector<replay_input> inputs;
-        inputs.reserve(n_valid);
+        inputs.reserve(n_rec);
 
-        for (size_t li = 0; li < rec_ids.size(); ++li) {
+        for (int li = 0; li < n_rec; ++li) {
             int il = rec_ids[li];
-            auto & tape = tape_layers[li];
 
-            if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+            int64_t S, H_k, H_v;
+            if (use_gpu_tape) {
+                auto & tl = dflash_capture->tape_gpu->layers[li];
+                S   = tl.k->ne[0];
+                H_k = tl.k->ne[1];
+                H_v = tl.v->ne[1];
+            } else {
+                auto & tape = tape_layers[li];
+                if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+                S   = tape.S_k;
+                H_k = tape.H_k;
+                H_v = tape.H_v;
+            }
 
-            const int64_t S   = tape.S_k; // S_k == S_v
-            const int64_t H_k = tape.H_k;
-            const int64_t H_v = tape.H_v;
+            ggml_tensor * k_in, * v_in, * g_in, * b_in;
 
-            // input tensors (allocated on GPU by alloc_ctx_tensors)
+            if (use_gpu_tape) {
+                // create views into pre-filled GPU tape tensors (zero upload)
+                auto & tl = dflash_capture->tape_gpu->layers[li];
+                k_in = ggml_view_4d(ctx, tl.k, S, H_k, (int64_t)n_accepted, (int64_t)1,
+                    tl.k->nb[1], tl.k->nb[2], tl.k->nb[2] * n_accepted, 0);
+                v_in = ggml_view_4d(ctx, tl.v, S, H_v, (int64_t)n_accepted, (int64_t)1,
+                    tl.v->nb[1], tl.v->nb[2], tl.v->nb[2] * n_accepted, 0);
+                g_in = ggml_view_4d(ctx, tl.gate, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1,
+                    tl.gate->nb[1], tl.gate->nb[2], tl.gate->nb[2] * n_accepted, 0);
+                b_in = ggml_view_4d(ctx, tl.beta, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1,
+                    tl.beta->nb[1], tl.beta->nb[2], tl.beta->nb[2] * n_accepted, 0);
+            } else {
+                // allocate new tensors (will be filled from CPU tape data)
+                k_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
+                v_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, (int64_t)n_accepted, (int64_t)1);
+                g_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+                b_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+                ggml_set_input(k_in); ggml_set_input(v_in);
+                ggml_set_input(g_in); ggml_set_input(b_in);
+            }
+
+            // Q: zeros (attention output discarded, only state update matters)
             ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
-            ggml_tensor * k_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
-            ggml_tensor * v_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, (int64_t)n_accepted, (int64_t)1);
-            ggml_tensor * g_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
-            ggml_tensor * b_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
-            ggml_set_input(q_in); ggml_set_input(k_in); ggml_set_input(v_in);
-            ggml_set_input(g_in); ggml_set_input(b_in);
+            ggml_set_input(q_in);
 
-            // apply sigmoid to beta on GPU (matches forward pass FP behavior exactly)
+            // apply sigmoid to beta on GPU
             ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
 
             // state view: reads directly from recurrent memory GPU buffer (zero-copy)
@@ -1241,10 +1350,15 @@ void llama_context::tape_replay(int n_accepted) {
             ggml_tensor * cpy = ggml_cpy(ctx, result_state, s_write);
             ggml_build_forward_expand(graph, cpy);
 
-            inputs.push_back({ q_in, k_in, v_in, g_in, b_in, li });
+            inputs.push_back({ q_in, k_in, v_in, g_in, b_in, (size_t)li });
         }
 
-        // allocate non-view tensors on GPU (reuse persistent buffer when possible)
+        if (inputs.empty()) {
+            ggml_free(ctx);
+            goto conv_rebuild;
+        }
+
+        // allocate non-view tensors on GPU (reuse persistent buffer)
         ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
         size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, gpu_buft);
 
@@ -1278,31 +1392,31 @@ void llama_context::tape_replay(int n_accepted) {
             }
         }
 
-        // upload tape data (CPU→GPU, ~24MB total)
+        // upload data for tensors that need it
         for (auto & inp : inputs) {
-            auto & tape = tape_layers[inp.tape_li];
-            const int64_t S   = tape.S_k;
-            const int64_t H_k = tape.H_k;
-            const int64_t H_v = tape.H_v;
-
-            // Q: zeros (attention output is discarded, only state update matters)
+            // Q: always needs zeros
             {
-                size_t q_size = (size_t)(S * H_k * n_accepted);
+                const int64_t S = inp.q->ne[0];
+                const int64_t H = inp.q->ne[1];
+                size_t q_size = (size_t)(S * H * n_accepted);
                 if (dflash_capture->replay_zeros.size() < q_size) {
                     dflash_capture->replay_zeros.resize(q_size, 0.0f);
                 }
                 ggml_backend_tensor_set(inp.q, dflash_capture->replay_zeros.data(), 0, ggml_nbytes(inp.q));
             }
 
-            // K, V: from tape (already in correct ggml layout)
-            ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
-            ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
+            // K, V, gate, beta: only upload from CPU if not using GPU tape
+            if (!use_gpu_tape) {
+                auto & tape = tape_layers[inp.tape_li];
+                const int64_t S   = tape.S_k;
+                const int64_t H_k = tape.H_k;
+                const int64_t H_v = tape.H_v;
 
-            // gate: pre-exp values (GDN kernel applies expf)
-            ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
-
-            // beta: pre-sigmoid values (sigmoid applied by ggml_sigmoid op in graph)
-            ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+                ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
+                ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
+                ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
+                ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+            }
         }
 
         // compute: runs all GDN ops + state copies on GPU

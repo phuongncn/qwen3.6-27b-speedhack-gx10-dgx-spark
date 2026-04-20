@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-memory-recurrent.h"
+#include "llama-context.h"
 
 llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
@@ -228,6 +229,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    ggml_tensor * beta_presigmoid = beta; // save for GPU tape capture (pre-sigmoid)
     beta = ggml_sigmoid(ctx0, beta);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
@@ -338,6 +340,45 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    // GPU tape: copy k/v/gate/beta directly to persistent GPU buffer (no eval callback sync)
+    if (cparams.tape_gpu) {
+        auto * tgpu = cparams.tape_gpu;
+        // find tape layer index for this model layer
+        int li = -1;
+        for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
+            if (tgpu->layer_ids[i] == il) { li = i; break; }
+        }
+        if (li >= 0 && n_seq_tokens <= tgpu->max_tokens) {
+            auto & tl = tgpu->layers[li];
+
+            // ensure sources are contiguous (v_conv is a non-contiguous view)
+            ggml_tensor * k_cont = ggml_cont_3d(ctx0, k_conv, k_conv->ne[0], k_conv->ne[1], n_seq_tokens);
+            ggml_tensor * v_cont = ggml_cont_3d(ctx0, v_conv, v_conv->ne[0], v_conv->ne[1], n_seq_tokens);
+            ggml_tensor * g_cont = ggml_cont_3d(ctx0, gate, gate->ne[0], gate->ne[1], n_seq_tokens);
+            ggml_tensor * b_cont = ggml_cont_3d(ctx0, beta_presigmoid,
+                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens);
+
+            // destination views (sliced to actual n_tokens from max_tokens allocation)
+            ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,
+                tl.k->ne[0], tl.k->ne[1], (int64_t)n_seq_tokens,
+                tl.k->nb[1], tl.k->nb[2], 0);
+            ggml_tensor * v_dst = ggml_view_3d(ctx0, tl.v,
+                tl.v->ne[0], tl.v->ne[1], (int64_t)n_seq_tokens,
+                tl.v->nb[1], tl.v->nb[2], 0);
+            ggml_tensor * g_dst = ggml_view_3d(ctx0, tl.gate,
+                tl.gate->ne[0], tl.gate->ne[1], (int64_t)n_seq_tokens,
+                tl.gate->nb[1], tl.gate->nb[2], 0);
+            ggml_tensor * b_dst = ggml_view_3d(ctx0, tl.beta,
+                tl.beta->ne[0], tl.beta->ne[1], (int64_t)n_seq_tokens,
+                tl.beta->nb[1], tl.beta->nb[2], 0);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cont, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v_cont, v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, g_cont, g_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, b_cont, b_dst));
+        }
+    }
 
     auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
 

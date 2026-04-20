@@ -515,6 +515,7 @@ int main(int argc, char ** argv) {
                     reject_pos[rej_pos]++;
                 }
             }
+
         }
 
         {

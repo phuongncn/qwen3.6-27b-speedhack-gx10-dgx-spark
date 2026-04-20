@@ -1324,9 +1324,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
         // positions are relative to the context window fed to the drafter
+        // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
+        const int batch_len = n_draft + 1;
         common_batch_clear(batch_dft);
         common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
-        for (int i = 1; i < block_size; ++i) {
+        for (int i = 1; i < batch_len; ++i) {
             common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
         }
 
@@ -1341,13 +1343,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t3 = ggml_time_us();
 
-        // read argmax tokens for positions 1..block_size-1 (skip position 0 = staged_first)
+        // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
         {
             int32_t * argmax = llama_get_logits_argmax(ctx_dft);
             float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
             if (argmax) {
                 // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
-                for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
+                for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                     result.push_back((llama_token) argmax[i]);
                     if (draft_log_probs && argmax_probs) {
                         draft_log_probs->push_back(argmax_probs[i]);
@@ -1356,7 +1358,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             } else {
                 // fallback: CPU argmax over full vocab
                 const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
+                for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                     float * logits = llama_get_logits_ith(ctx_dft, i);
                     if (!logits) {
                         break;

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+struct dflash_tape_gpu;
+
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
@@ -48,6 +50,9 @@ struct llama_cparams {
 
     // DFlash: drafter sampling temperature (0 = greedy argmax, >0 = Gumbel sampling)
     float dflash_sample_temp = 0.0f;
+
+    // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync)
+    dflash_tape_gpu * tape_gpu = nullptr;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

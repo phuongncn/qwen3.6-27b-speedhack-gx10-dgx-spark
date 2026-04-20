@@ -55,6 +55,28 @@ struct dflash_tape_layer {
     int n_tokens = 0;
 };
 
+// GPU-resident tape: persistent tensors that the graph writes into directly (no eval callback sync)
+struct dflash_tape_gpu_layer {
+    ggml_tensor * k    = nullptr;  // [S_k, H_k, max_tokens]
+    ggml_tensor * v    = nullptr;  // [S_v, H_v, max_tokens]
+    ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
+    ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
+};
+
+struct dflash_tape_gpu {
+    std::vector<dflash_tape_gpu_layer> layers;  // one per recurrent layer
+    std::vector<int32_t> layer_ids;             // model layer indices → tape index mapping
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context * ctx = nullptr;               // owns the tensor descriptors
+    int max_tokens = 0;                         // allocated capacity
+    int n_tokens = 0;                           // actual tokens recorded this pass
+
+    ~dflash_tape_gpu() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
 enum dflash_tape_type {
     DFLASH_TAPE_K    = 0,
     DFLASH_TAPE_V    = 1,
@@ -82,7 +104,10 @@ struct dflash_capture_data {
     bool tape_enabled = false;
     std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
-    std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer
+    std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
+
+    // GPU-resident tape: graph writes directly to these tensors (no eval callback sync)
+    std::unique_ptr<dflash_tape_gpu> tape_gpu;
 
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
     ggml_backend_buffer_t replay_buf = nullptr;
@@ -315,6 +340,9 @@ public:
 
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
+
+    // DFlash: allocate GPU-resident tape buffer for graph-embedded recording
+    void allocate_tape_gpu(int max_tokens);
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
     void tape_replay(int n_accepted);
