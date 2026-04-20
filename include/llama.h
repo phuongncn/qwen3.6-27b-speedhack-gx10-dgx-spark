@@ -1078,6 +1078,9 @@ extern "C" {
             int                    n_past_before,
             int                    n_accepted);
 
+    // DFlash: wait for async tape replay to complete (must be called before next verify)
+    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+
     // DFlash: prepare DeltaNet state for branch verification (Phase 2 multi-pass)
     // Restores recurrent state from backup and tape-replays to given depth.
     // Does NOT touch attention KV cache or destroy the backup.

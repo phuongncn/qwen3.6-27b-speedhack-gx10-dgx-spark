@@ -350,6 +350,7 @@ int main(int argc, char ** argv) {
                 main_path_len = tree.main_path_len;
 
                 if (needs_reeval) {
+                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
                     common_time_meas tm(t_backup_total);
                     auto * mem = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);
@@ -446,6 +447,7 @@ int main(int argc, char ** argv) {
                 }
 
                 if (needs_reeval && !draft.empty()) {
+                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
                     common_time_meas tm(t_backup_total);
                     auto * mem = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);

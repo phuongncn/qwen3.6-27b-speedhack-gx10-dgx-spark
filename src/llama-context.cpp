@@ -1201,6 +1201,9 @@ void llama_context::tape_replay(int n_accepted) {
         return;
     }
 
+    // ensure any previous async replay is complete before launching a new one
+    tape_replay_sync();
+
     // GPU-resident tape path: data already on GPU from graph-embedded copies
     const bool use_gpu_tape = (dflash_capture->tape_gpu != nullptr &&
                                n_accepted <= dflash_capture->tape_gpu->max_tokens);
@@ -1419,14 +1422,29 @@ void llama_context::tape_replay(int n_accepted) {
             }
         }
 
-        // compute: runs all GDN ops + state copies on GPU
-        ggml_backend_graph_compute(gpu_backend, graph);
+        // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
+        ggml_backend_graph_compute_async(gpu_backend, graph);
 
-        // cleanup ggml context (buffer is persistent, reused across calls)
-        ggml_free(ctx);
+        // save deferred state for async completion
+        dflash_capture->replay_pending = true;
+        dflash_capture->replay_gpu_backend = gpu_backend;
+        dflash_capture->replay_graph_ctx = ctx; // freed in tape_replay_sync
+        dflash_capture->replay_n_accepted = n_accepted;
+        dflash_capture->replay_cell_idx = cell_idx;
+        dflash_capture->replay_mem_recurrent = mem_recurrent;
+        return; // conv rebuild deferred to tape_replay_sync()
     }
 
 conv_rebuild:
+    tape_replay_conv(mem_recurrent, cell_idx, n_accepted);
+}
+
+void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers   = dflash_capture->tape_layers;
+    const uint32_t n_embd_r = hparams.n_embd_r();
+
     // rebuild conv state from qkv_mixed tape (small, CPU is fine)
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
@@ -1468,6 +1486,26 @@ conv_rebuild:
             mem_recurrent->cells[tail].pos += n_accepted;
         }
     }
+}
+
+void llama_context::tape_replay_sync() {
+    if (!dflash_capture || !dflash_capture->replay_pending) {
+        return;
+    }
+
+    // wait for async GDN graph to complete
+    ggml_backend_synchronize(dflash_capture->replay_gpu_backend);
+
+    // free the graph context
+    ggml_free(dflash_capture->replay_graph_ctx);
+    dflash_capture->replay_graph_ctx = nullptr;
+
+    // finish conv rebuild + position advance
+    tape_replay_conv(dflash_capture->replay_mem_recurrent,
+                     dflash_capture->replay_cell_idx,
+                     dflash_capture->replay_n_accepted);
+
+    dflash_capture->replay_pending = false;
 }
 
 // CPU fallback for tape replay (used when no GPU backend available)
@@ -2133,7 +2171,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
-    // DFlash hidden state capture is now handled by the eval callback
+    // DFlash hidden state capture is handled by the eval callback
     // (dflash_eval_callback) — no post-graph readback needed here
 
     // TODO: hacky solution
@@ -2591,7 +2629,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
-        // DFlash hidden state capture is now handled by the eval callback
+        // DFlash hidden state capture is handled by the eval callback
         // (dflash_eval_callback) — no post-graph readback needed here
 
         n_outputs_prev += n_outputs;
@@ -3938,6 +3976,10 @@ void llama_set_tape_recording(llama_context * ctx, bool enable) {
 
 void llama_tape_replay(llama_context * ctx, int n_accepted) {
     ctx->tape_replay(n_accepted);
+}
+
+void llama_tape_replay_sync(llama_context * ctx) {
+    ctx->tape_replay_sync();
 }
 
 void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_backup, int n_past_before, int n_accepted) {

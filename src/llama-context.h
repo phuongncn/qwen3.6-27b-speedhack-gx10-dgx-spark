@@ -116,7 +116,18 @@ struct dflash_capture_data {
     // S2: pre-allocated zeros buffer for Q input (avoids per-call alloc+zero)
     std::vector<float> replay_zeros;
 
+    // async tape replay state (GDN launched, waiting for sync before conv rebuild)
+    bool replay_pending = false;
+    ggml_backend_t replay_gpu_backend = nullptr;
+    ggml_context * replay_graph_ctx = nullptr;
+    int replay_n_accepted = 0;
+    int32_t replay_cell_idx = -1;
+    llama_memory_recurrent * replay_mem_recurrent = nullptr;
+
     ~dflash_capture_data() {
+        if (replay_graph_ctx) {
+            ggml_free(replay_graph_ctx);
+        }
         if (replay_buf) {
             ggml_backend_buffer_free(replay_buf);
         }
@@ -346,6 +357,8 @@ public:
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
     void tape_replay(int n_accepted);
+    void tape_replay_sync();
+    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)

@@ -70,10 +70,6 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
         // Input for next layer
         inpL = cur;
-
-        // DFlash hidden state capture is handled by the eval callback
-        // (dflash_eval_callback) which reads "l_out-{il}" tensors during
-        // graph execution. No graph modification needed here.
     }
     cur = inpL;
 
