@@ -1213,16 +1213,25 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t3 = ggml_time_us();
 
-        // read logits and argmax for positions 1..block_size-1 (skip position 0 = staged_first)
+        // read argmax tokens for positions 1..block_size-1 (skip position 0 = staged_first)
         {
-            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-            for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
-                float * logits = llama_get_logits_ith(ctx_dft, i);
-                if (!logits) {
-                    break;
+            int32_t * argmax = llama_get_logits_argmax(ctx_dft);
+            if (argmax) {
+                // GPU argmax path — only 64 bytes transferred instead of 15.9MB
+                for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
+                    result.push_back((llama_token) argmax[i]);
                 }
-                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
-                result.push_back(best);
+            } else {
+                // fallback: CPU argmax over full vocab
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+                for (int i = 1; i < block_size && (int) result.size() < n_draft; ++i) {
+                    float * logits = llama_get_logits_ith(ctx_dft, i);
+                    if (!logits) {
+                        break;
+                    }
+                    llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                    result.push_back(best);
+                }
             }
         }
 

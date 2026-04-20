@@ -227,5 +227,8 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    // GPU argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
+    res->t_logits_argmax = ggml_argmax(ctx0, cur);
+
+    ggml_build_forward_expand(gf, res->t_logits_argmax);
 }

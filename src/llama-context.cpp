@@ -839,6 +839,18 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+int32_t * llama_context::get_logits_argmax() {
+    synchronize();
+    if (logits_argmax_buf.empty()) {
+        return nullptr;
+    }
+    return logits_argmax_buf.data();
+}
+
+int32_t llama_context::get_logits_argmax_n() {
+    return logits_argmax_count;
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1918,8 +1930,18 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_logits = res->get_logits();
     auto * t_embd = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
 
-    // extract logits
-    if (logits.data && t_logits) {
+    // extract logits argmax (GPU-side, tiny transfer)
+    auto * t_argmax_enc = res->t_logits_argmax;
+    if (t_argmax_enc && n_tokens > 0) {
+        ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax_enc);
+        GGML_ASSERT(backend_argmax != nullptr);
+        logits_argmax_buf.resize(n_tokens);
+        ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_buf.data(), 0, n_tokens * sizeof(int32_t));
+        logits_argmax_count = n_tokens;
+    }
+
+    // extract logits (skip if GPU argmax available)
+    if (logits.data && t_logits && !t_argmax_enc) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
@@ -2340,8 +2362,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
-        // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        // extract logits argmax (GPU-side, tiny transfer — 64 bytes vs 15.9MB)
+        auto * t_argmax = res->t_logits_argmax;
+        if (t_argmax && n_outputs > 0) {
+            ggml_backend_t backend_argmax = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
+            GGML_ASSERT(backend_argmax != nullptr);
+            logits_argmax_buf.resize(n_outputs);
+            ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_buf.data(), 0, n_outputs * sizeof(int32_t));
+            logits_argmax_count = n_outputs;
+        }
+
+        // extract logits (skip if argmax is available and no one needs raw logits)
+        if (logits.data && t_logits && n_outputs > 0 && !t_argmax && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3710,6 +3742,15 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+int32_t * llama_get_logits_argmax(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax();
+}
+
+int32_t llama_get_logits_argmax_n(llama_context * ctx) {
+    return ctx->get_logits_argmax_n();
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

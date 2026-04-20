@@ -1012,6 +1012,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Get GPU-computed argmax of logits for all output positions.
+    // Returns array of n token IDs, or NULL if not available.
+    LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);
+    LLAMA_API int32_t   llama_get_logits_argmax_n(struct llama_context * ctx);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

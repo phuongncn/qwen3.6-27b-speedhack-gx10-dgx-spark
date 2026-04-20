@@ -858,6 +858,9 @@ void llm_graph_result::set_outputs() {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
+    if (t_logits_argmax != nullptr) {
+        ggml_set_output(t_logits_argmax);
+    }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
     }
