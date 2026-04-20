@@ -432,7 +432,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     const int64_t n_seq_tokens = q->ne[2];
 
     // Tree-mode: use tree-aware kernel when parent_ids are set and multi-token batch
-    if (tree_parent_ids && n_seq_tokens > 1 && tree_ssm_intermediates) {
+    if (tree_parent_ids && n_seq_tokens > 1 && tree_ssm_intermediates &&
+        n_seq_tokens <= ggml_nelements(tree_parent_ids)) {
         // Find the recurrent layer index for this model layer
         int recurrent_idx = 0;
         for (int i = 0; i < il; i++) {

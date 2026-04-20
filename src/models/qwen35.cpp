@@ -263,7 +263,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1);
+    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 &&
+                             n_seq_tokens <= ggml_nelements(tree_parent_ids));
 
     // Update convolution state cache (skip in tree mode — rollback handles it)
     if (!tree_mode) {
