@@ -1049,6 +1049,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // argmax with temperature scaling and Gumbel noise (sampling via Gumbel-max trick)
+    // when temp > 0 and seed != 0: samples from softmax(a/temp) distribution
+    // when temp == 0 or seed == 0: equivalent to regular argmax
+    GGML_API struct ggml_tensor * ggml_argmax_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 temp,
+            uint64_t              seed);
+
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
             struct ggml_context * ctx,

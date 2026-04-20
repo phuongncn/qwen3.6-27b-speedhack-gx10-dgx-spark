@@ -1016,6 +1016,8 @@ extern "C" {
     // Returns array of n token IDs, or NULL if not available.
     LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);
     LLAMA_API int32_t   llama_get_logits_argmax_n(struct llama_context * ctx);
+    // Log-probabilities of argmax tokens (available when dflash_sample_temp > 0).
+    LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1050,6 +1052,10 @@ extern "C" {
     // layer_ids: array of layer indices, n_layers: number of layers
     // Pass n_layers=0 to disable capture
     LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+
+    // DFlash: set drafter sampling temperature (Gumbel-max trick)
+    // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
+    LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);
 
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)

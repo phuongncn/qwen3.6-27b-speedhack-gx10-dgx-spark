@@ -851,6 +851,14 @@ int32_t llama_context::get_logits_argmax_n() {
     return logits_argmax_count;
 }
 
+float * llama_context::get_logits_argmax_probs() {
+    synchronize();
+    if (logits_argmax_prob_buf.empty() || cparams.dflash_sample_temp <= 0.0f) {
+        return nullptr;
+    }
+    return logits_argmax_prob_buf.data();
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1046,6 +1054,10 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     }
 
     return true;
+}
+
+void llama_context::set_dflash_sample_temp(float temp) {
+    cparams.dflash_sample_temp = temp;
 }
 
 void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
@@ -1937,6 +1949,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_argmax != nullptr);
         logits_argmax_buf.resize(n_tokens);
         ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_buf.data(), 0, n_tokens * sizeof(int32_t));
+        // always read log-prob half (tensor is always [2*nrows])
+        logits_argmax_prob_buf.resize(n_tokens);
+        ggml_backend_tensor_get_async(backend_argmax, t_argmax_enc, logits_argmax_prob_buf.data(), n_tokens * sizeof(int32_t), n_tokens * sizeof(float));
         logits_argmax_count = n_tokens;
     }
 
@@ -2369,6 +2384,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_argmax != nullptr);
             logits_argmax_buf.resize(n_outputs);
             ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_buf.data(), 0, n_outputs * sizeof(int32_t));
+            logits_argmax_prob_buf.resize(n_outputs);
+            ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_prob_buf.data(), n_outputs * sizeof(int32_t), n_outputs * sizeof(float));
             logits_argmax_count = n_outputs;
         }
 
@@ -3753,6 +3770,11 @@ int32_t llama_get_logits_argmax_n(llama_context * ctx) {
     return ctx->get_logits_argmax_n();
 }
 
+float * llama_get_logits_argmax_probs(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax_probs();
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
@@ -3790,6 +3812,10 @@ int32_t llama_get_n_layer_hiddens(llama_context * ctx) {
 
 void llama_set_dflash_capture(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
     ctx->set_dflash_capture(layer_ids, n_layers);
+}
+
+void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
+    ctx->set_dflash_sample_temp(temp);
 }
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {

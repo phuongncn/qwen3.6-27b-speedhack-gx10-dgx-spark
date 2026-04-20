@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <atomic>
+
 // DFlash drafter custom graph input
 // Holds the target hidden states, context positions, and asymmetric non-causal attention mask
 class llm_graph_input_dflash : public llm_graph_input_i {
@@ -228,7 +230,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     res->t_logits = cur;
 
     // GPU argmax — avoids 15.9MB logits transfer + CPU scan for DFlash draft
-    res->t_logits_argmax = ggml_argmax(ctx0, cur);
+    // Always use ggml_argmax_ext for consistent graph reservation (output is [2*nrows]).
+    // When dflash_sample_temp > 0: Gumbel-max sampling + log-prob output.
+    // When temp=0, seed=0: pure argmax (no noise), log-prob slot unused.
+    const float sample_temp = cparams.dflash_sample_temp;
+    static std::atomic<uint64_t> gumbel_counter{1};
+    const uint64_t seed = (sample_temp > 0.0f) ? gumbel_counter.fetch_add(1) : 0;
+    res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, sample_temp, seed);
 
     ggml_build_forward_expand(gf, res->t_logits_argmax);
 }

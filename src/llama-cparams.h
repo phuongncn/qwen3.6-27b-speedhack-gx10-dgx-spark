@@ -46,6 +46,9 @@ struct llama_cparams {
     // DFlash: target layer indices to capture hidden states from (empty = disabled)
     std::vector<int> dflash_capture_layers;
 
+    // DFlash: drafter sampling temperature (0 = greedy argmax, >0 = Gumbel sampling)
+    float dflash_sample_temp = 0.0f;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

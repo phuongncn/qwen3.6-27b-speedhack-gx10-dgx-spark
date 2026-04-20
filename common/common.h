@@ -323,6 +323,7 @@ struct common_params_speculative {
     int32_t tree_budget  = 0;  // DDTree node budget (0 = flat DFlash, >0 = tree verification)
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
+    float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
 
     // ngram-based speculative decoding
 

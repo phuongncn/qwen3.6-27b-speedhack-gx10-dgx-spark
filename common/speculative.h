@@ -46,7 +46,8 @@ llama_tokens common_speculative_draft(
                      common_speculative * spec,
         const common_params_speculative & params,
                      const llama_tokens & prompt,
-                            llama_token   id_last);
+                            llama_token   id_last,
+                     std::vector<float> * draft_log_probs = nullptr);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

@@ -6,10 +6,98 @@
 #include "llama.h"
 
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
+
+// Rejection sampling verification for speculative decoding at temp > 0.
+// Accepts draft token x with probability min(1, p_target(x) / q_draft(x)).
+// On rejection, uses the target's sampled token instead.
+// Returns accepted tokens (at least 1, at most draft.size()+1).
+static std::vector<llama_token> speculative_reject_sample(
+        struct common_sampler * smpl,
+        struct llama_context  * ctx_tgt,
+        const llama_tokens    & draft,
+        const std::vector<float> & draft_log_probs,
+        float                   temp,
+        std::mt19937          & rng) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+    const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
+
+    std::vector<llama_token> result;
+    result.reserve(draft.size() + 1);
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        // sample from target at position i (through the full sampler chain)
+        const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, (int)i);
+
+        if (target_token == draft[i]) {
+            // exact match — always accept
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            continue;
+        }
+
+        // extension tokens (beyond draft_log_probs): exact match only
+        if (i >= draft_log_probs.size()) {
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            break;
+        }
+
+        // compute target's log-probability for the draft token
+        float * target_logits = llama_get_logits_ith(ctx_tgt, (int)i);
+        if (!target_logits) {
+            // no target logits — fall back to exact match (reject)
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            break;
+        }
+
+        // compute log p_target(draft[i]) via single-pass online softmax
+        float lse_max = -INFINITY;
+        float lse_sum = 0.0f;
+        for (int v = 0; v < n_vocab; v++) {
+            float scaled = target_logits[v] * inv_temp;
+            if (scaled > lse_max) {
+                lse_sum = lse_sum * expf(lse_max - scaled) + 1.0f;
+                lse_max = scaled;
+            } else {
+                lse_sum += expf(scaled - lse_max);
+            }
+        }
+        float p_log = target_logits[draft[i]] * inv_temp - lse_max - logf(lse_sum);
+
+        // acceptance probability = min(1, p_target / q_draft) = min(1, exp(p_log - q_log))
+        float q_log = draft_log_probs[i];
+        float accept_prob = expf(p_log - q_log);
+        if (accept_prob > 1.0f) accept_prob = 1.0f;
+
+        if (uniform(rng) < accept_prob) {
+            // accept draft token
+            common_sampler_accept(smpl, draft[i], true);
+            result.push_back(draft[i]);
+        } else {
+            // reject — use target's sample
+            common_sampler_accept(smpl, target_token, true);
+            result.push_back(target_token);
+            break;
+        }
+    }
+
+    // if all draft tokens accepted, sample one more from target
+    if (result.size() == draft.size()) {
+        const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, (int)draft.size());
+        common_sampler_accept(smpl, bonus, true);
+        result.push_back(bonus);
+    }
+
+    return result;
+}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -157,6 +245,10 @@ int main(int argc, char ** argv) {
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
     // init the speculator BEFORE prefill so DFlash can configure hidden state capture
+    // enable Gumbel sampling for DFlash drafter when target uses temp > 0
+    if (params.sampling.temp > 0.0f && params.speculative.sample_temp == 0.0f) {
+        params.speculative.sample_temp = params.sampling.temp;
+    }
     const auto & params_spec = params.speculative;
 
     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
@@ -195,6 +287,17 @@ int main(int argc, char ** argv) {
     int     n_reeval_skipped = 0; // iterations where all drafts accepted (no re-eval needed)
 
     const int tree_budget = params_spec.tree_budget;
+
+    // rejection sampling for temp > 0: enable when drafter provides log-probs
+    const float sample_temp = params.sampling.temp;
+    const bool use_rejection_sampling = (sample_temp > 0.0f && params_spec.sample_temp > 0.0f);
+    std::mt19937 reject_rng(params.sampling.seed != 0 ? params.sampling.seed : 42);
+
+    std::vector<float> draft_log_probs;
+    if (use_rejection_sampling) {
+        draft_log_probs.reserve(params_spec.n_max);
+        LOG_INF("rejection sampling enabled (temp=%.2f)\n", sample_temp);
+    }
 
     while (true) {
         n_iters++;
@@ -327,9 +430,11 @@ int main(int argc, char ** argv) {
         } else {
             // === Flat path: linear speculative decoding ===
             llama_tokens draft;
+            draft_log_probs.clear();
             {
                 common_time_meas tm(t_draft_total);
-                draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last);
+                draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last,
+                    use_rejection_sampling ? &draft_log_probs : nullptr);
             }
 
             common_batch_clear(batch_tgt);
@@ -368,7 +473,18 @@ int main(int argc, char ** argv) {
 
             {
                 common_time_meas tm(t_sample_total);
-                ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+                if (use_rejection_sampling && !draft_log_probs.empty()) {
+                    // pad log-probs for extension tokens (exact match: use -inf as log-prob
+                    // which gives accept_prob = exp(p_log - (-inf)) = inf → clamped to 1 → always accept...
+                    // that's wrong. Instead, pad with 0 (log-prob=0 means q=1, accept_prob=p/1=p → wrong).
+                    // Correct: for extension tokens without draft probs, use exact match.
+                    // Extend draft_log_probs to match draft size with a sentinel.
+                    // speculative_reject_sample handles i >= draft_log_probs.size() as exact match.
+                    ids = speculative_reject_sample(smpl, ctx_tgt, draft, draft_log_probs,
+                        sample_temp, reject_rng);
+                } else {
+                    ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+                }
             }
 
             n_draft_this_iter = (int)draft.size();
@@ -579,6 +695,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
+    common_speculative_print_stats(spec);
 
     LOG_INF("\n");
     LOG_INF("target:\n\n");
