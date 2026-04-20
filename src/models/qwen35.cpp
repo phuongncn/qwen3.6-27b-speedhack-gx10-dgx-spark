@@ -263,28 +263,43 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    // Update convolution state cache
-    // Extract the last (conv_kernel_size - 1) states from conv_input
-    ggml_tensor * last_conv_states =
-        ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
-                     conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
-    cb(last_conv_states, "last_conv_states", il);
+    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1);
 
-    ggml_tensor * state_update_target =
-        ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
-                     kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
-    cb(state_update_target, "state_update_target", il);
+    // Update convolution state cache (skip in tree mode — rollback handles it)
+    if (!tree_mode) {
+        ggml_tensor * last_conv_states =
+            ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
+                         conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+        cb(last_conv_states, "last_conv_states", il);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+        ggml_tensor * state_update_target =
+            ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
+                         kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
+        cb(state_update_target, "state_update_target", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    ggml_tensor * conv_output_proper;
+    if (tree_mode) {
+        // Tree-mode conv: follows parent pointers for convolution window (fuses silu)
+        conv_output_proper = ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids);
+        cb(conv_output_proper, "conv_output_tree", il);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+    }
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    ggml_tensor * conv_output_silu;
+    if (tree_mode) {
+        conv_output_silu = conv_output_proper; // silu already fused in tree conv kernel
+    } else {
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
@@ -383,11 +398,13 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // Update the recurrent states (skip in tree mode — rollback handles it)
+    if (!tree_mode) {
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

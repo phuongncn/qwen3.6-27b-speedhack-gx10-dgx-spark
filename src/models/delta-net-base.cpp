@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "ggml.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -429,6 +430,43 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
+
+    // Tree-mode: use tree-aware kernel when parent_ids are set and multi-token batch
+    if (tree_parent_ids && n_seq_tokens > 1 && tree_ssm_intermediates) {
+        // Find the recurrent layer index for this model layer
+        int recurrent_idx = 0;
+        for (int i = 0; i < il; i++) {
+            if (hparams.is_recurrent(i)) {
+                recurrent_idx++;
+            }
+        }
+
+        GGML_ASSERT(recurrent_idx < tree_n_recurrent_layers);
+        ggml_tensor * persist_inter = (*tree_ssm_intermediates)[recurrent_idx];
+
+        const int64_t S_v = v->ne[0];
+        const int64_t H_v = v->ne[1];
+        const int64_t n_tokens = v->ne[2];
+        const int64_t n_seqs = v->ne[3];
+
+        ggml_tensor * result = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter);
+        cb(result, "fgdn_tree", il);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, result,
+                S_v, H_v, n_tokens, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+        ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * S_v),
+                ggml_row_size(result->type, S_v * S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+        return {output, new_state};
+    }
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {

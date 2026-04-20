@@ -1101,6 +1101,18 @@ extern "C" {
     // DDTree: clear tree attention mask after verification
     LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
 
+    // DDTree: set parent IDs for tree-mode SSM kernels (enables tree-parallel DeltaNet)
+    LLAMA_API void llama_set_tree_parent_ids(struct llama_context * ctx, const int32_t * parents, int n_tokens);
+
+    // DDTree: clear tree parent IDs after verification
+    LLAMA_API void llama_clear_tree_parent_ids(struct llama_context * ctx);
+
+    // DDTree: allocate persistent SSM intermediate buffers for tree verification
+    LLAMA_API void llama_allocate_tree_buffers(struct llama_context * ctx, int max_tree_tokens);
+
+    // DDTree: rollback SSM state to committed token using stored intermediates
+    LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents);
+
     // DFlash: share tok_embd and output tensors from src model to dst model
     // Used to avoid duplicating embedding/lm_head weights between target and drafter
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);

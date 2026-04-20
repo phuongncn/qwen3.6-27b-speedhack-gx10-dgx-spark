@@ -5,6 +5,7 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
@@ -307,10 +308,11 @@ int main(int argc, char ** argv) {
         int main_path_len = 0;
         bool has_backup = false;
         bool accepted_on_main_path = true;
+        common_speculative_tree tree;
+        int commit_n = 0;
 
         if (tree_budget > 0) {
-            // === DDTree path: tree-structured speculative decoding ===
-            common_speculative_tree tree;
+            // === DDTree path: single-pass tree-structured speculative decoding ===
             {
                 common_time_meas tm(t_draft_total);
                 tree = common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last, tree_budget);
@@ -325,7 +327,6 @@ int main(int argc, char ** argv) {
                     common_time_meas tm(t_decode1_total);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
-                // update DFlash drafter hidden states from this single-token decode
                 {
                     llama_tokens batch_tokens = { id_last };
                     common_speculative_update_logits(spec, ctx_tgt, batch_tokens, 1);
@@ -337,20 +338,17 @@ int main(int argc, char ** argv) {
                     ids.push_back(t);
                 }
             } else {
-                // Phase 2 multi-pass: verify main path cleanly, lazy-decode branches
-                // Pass 1: flat main-path batch (no tree mask, clean DeltaNet)
+                // Single-pass tree verify: batch ALL tree nodes with tree mask + parent_ids
                 common_batch_add(batch_tgt, id_last, n_past, {0}, true);
-                for (int i = 0; i < tree.main_path_len; ++i) {
+                for (int i = 0; i < tree.n_nodes; ++i) {
                     common_batch_add(batch_tgt, tree.tokens[i], n_past + tree.depths[i], {0}, true);
                 }
-                const int n_past_root = n_past;
-                n_past++;
 
                 n_draft_this_iter = tree.n_nodes;
                 main_path_len = tree.main_path_len;
 
                 if (needs_reeval) {
-                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
+                    llama_tape_replay_sync(ctx_tgt);
                     common_time_meas tm(t_backup_total);
                     auto * mem = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);
@@ -358,74 +356,62 @@ int main(int argc, char ** argv) {
                     has_backup = true;
                 }
 
-                if (use_tape_replay) {
-                    llama_set_tape_recording(ctx_tgt, true);
-                }
+                // Set tree mask (attention layers) + parent_ids (DeltaNet layers)
+                llama_set_tree_mask(ctx_tgt, tree.visibility.data(), tree.n_nodes + 1);
+                llama_set_tree_parent_ids(ctx_tgt, tree.parents.data(), tree.n_nodes + 1);
+
                 {
                     common_time_meas tm(t_decode1_total);
                     llama_decode(ctx_tgt, batch_tgt);
                 }
-                if (use_tape_replay) {
-                    llama_set_tape_recording(ctx_tgt, false);
-                }
 
-                // tree walk with lazy branch evaluation
+                llama_clear_tree_mask(ctx_tgt);
+                llama_clear_tree_parent_ids(ctx_tgt);
+
+                // Tree walk: all logits available from single pass
                 {
                     int current = 0;
-                    int sample_idx = 0;
-                    bool on_main_path_walk = true;
 
                     while (true) {
                         llama_token target_token;
                         {
                             common_time_meas tm_s(t_sample_total);
-                            target_token = common_sampler_sample(smpl, ctx_tgt, sample_idx);
+                            target_token = common_sampler_sample(smpl, ctx_tgt, current);
                             common_sampler_accept(smpl, target_token, true);
                             ids.push_back(target_token);
                         }
 
                         auto it = tree.child_maps[current].find(target_token);
                         if (it == tree.child_maps[current].end()) {
-                            break;
+                            break; // mismatch = bonus token
                         }
 
                         int next = it->second;
+                        current = next;
+                        commit_n = next;
 
-                        if (next <= tree.main_path_len) {
-                            current = next;
-                            sample_idx = next;
-                        } else {
-                            // branch node: restore DeltaNet to divergence point, then decode
+                        if (next > tree.main_path_len) {
                             accepted_on_main_path = false;
-                            int div_depth = tree.depths[next - 1];
-
-                            {
-                                common_time_meas tm(t_decode1_total);
-                                if (on_main_path_walk) {
-                                    llama_dflash_prepare_branch(ctx_tgt, seq_backup, div_depth);
-                                    on_main_path_walk = false;
-                                }
-
-                                common_batch_clear(batch_tgt);
-                                common_batch_add(batch_tgt, tree.tokens[next - 1],
-                                                n_past_root + div_depth, {0}, true);
-                                llama_decode(ctx_tgt, batch_tgt);
-                            }
-
-                            current = next;
-                            sample_idx = 0;
                         }
                     }
                 }
 
-                // update drafter hidden states (only when main-path accepted — hidden states are clean)
-                if (accepted_on_main_path) {
-                    llama_tokens batch_tokens;
-                    batch_tokens.push_back(id_last);
-                    for (int i = 0; i < tree.main_path_len; ++i) {
-                        batch_tokens.push_back(tree.tokens[i]);
+                // Update drafter hidden states with accepted path tokens
+                {
+                    llama_tokens accepted_tokens;
+                    accepted_tokens.push_back(id_last);
+                    // Walk accepted path to collect tokens
+                    int node = commit_n;
+                    std::vector<int> path;
+                    while (node > 0) {
+                        path.push_back(node);
+                        node = tree.parents[node];
                     }
-                    common_speculative_update_logits(spec, ctx_tgt, batch_tokens, (int)ids.size());
+                    std::reverse(path.begin(), path.end());
+                    for (int idx : path) {
+                        accepted_tokens.push_back(tree.tokens[idx - 1]);
+                    }
+                    common_speculative_update_logits(spec, ctx_tgt, accepted_tokens, (int)ids.size());
                 }
             }
         } else {
@@ -546,54 +532,32 @@ int main(int argc, char ** argv) {
 
         if (has_backup && !has_eos) {
             if (tree_budget > 0) {
-                // DDTree rollback
-                // "all accepted" = accepted entire main path (branches are lazily decoded,
-                // so tree.n_nodes may exceed main_path_len — can't use n_draft_this_iter)
-                const bool all_accepted = accepted_on_main_path &&
-                    ((int)ids.size() == main_path_len + 1);
+                // DDTree single-pass rollback
+                // All tree nodes were decoded in one pass. SSM state stored in intermediates.
+                const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
                 const int n_past_before = n_past - (int)ids.size();
 
+                auto * mem = llama_get_memory(ctx_tgt);
                 if (all_accepted) {
-                    // all drafted tokens accepted — just clean up backup and trim KV
-                    auto * mem = llama_get_memory(ctx_tgt);
+                    // All tree nodes on accepted path — clean up backup, trim extra KV
                     llama_memory_seq_rm(mem, seq_backup, -1, -1);
                     llama_memory_seq_rm(mem, 0, n_past, -1);
+                    // SSM state after full tree verify is correct (last token = commit_n)
                     n_reeval_skipped++;
-                } else if (accepted_on_main_path && use_tape_replay) {
-                    // accepted path is on main path — tape replay for DeltaNet, KV trim for attention
-                    // Phase 2: no branch KV entries exist (branches decoded lazily, none reached)
-                    {
-                        common_time_meas tm(t_decode2_total);
-                        llama_dflash_rollback(ctx_tgt, seq_backup, n_past_before, (int)ids.size());
-                        n_reeval_tokens += (int)ids.size();
-                        n_reeval_calls++;
-                    }
-                    n_past = (int)prompt_tgt.size();
                 } else {
-                    // branch acceptance or no tape: full re-eval
-                    // (branch decode leaves main-path KV at branch depth — clean re-eval needed)
                     {
                         common_time_meas tm(t_restore_total);
-                        auto * mem = llama_get_memory(ctx_tgt);
-                        llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                        llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
                     }
-                    common_batch_clear(batch_tgt);
-                    for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
-                        common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
-                    }
-                    if (batch_tgt.n_tokens > 0) {
+                    {
                         common_time_meas tm(t_decode2_total);
-                        llama_decode(ctx_tgt, batch_tgt);
-                        n_reeval_tokens += batch_tgt.n_tokens;
+                        llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data());
+                        n_reeval_tokens += commit_n;
                         n_reeval_calls++;
                     }
-                    // update DFlash drafter hidden states from re-eval
-                    {
-                        llama_tokens reeval_tokens(prompt_tgt.begin() + n_past_before, prompt_tgt.end());
-                        common_speculative_update_logits(spec, ctx_tgt, reeval_tokens, (int)reeval_tokens.size());
-                    }
+                    // KV cache: keep only positions up to accepted path end
+                    int kv_keep = n_past_before + (int)ids.size();
+                    llama_memory_seq_rm(mem, 0, kv_keep, -1);
                     n_past = (int)prompt_tgt.size();
                 }
             } else {

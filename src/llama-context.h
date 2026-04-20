@@ -374,6 +374,16 @@ public:
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();
 
+    // DDTree: tree-mode parent IDs for SSM kernels
+    void set_tree_parent_ids(const int32_t * parents, int n_tokens);
+    void clear_tree_parent_ids();
+
+    // DDTree: allocate persistent intermediate buffers for tree verify
+    void allocate_tree_buffers(int max_tree_tokens);
+
+    // DDTree: rollback SSM state to accepted token from intermediates
+    void tree_rollback(int commit_n, const int32_t * parents);
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -447,6 +457,18 @@ private:
 
     // DDTree: tree attention mask (set before verification decode, cleared after)
     llama_tree_mask tree_mask;
+
+    // DDTree: tree-mode parent IDs and persistent SSM intermediate buffers
+    struct {
+        bool active = false;
+        int n_tokens = 0;
+        std::vector<int32_t> parent_ids_cpu;       // [max_tree_tokens] host copy
+        ggml_backend_buffer_t buffer = nullptr;    // GPU allocation for all intermediates + parent_ids
+        ggml_context * ggml_ctx = nullptr;         // context owning tensor metadata
+        ggml_tensor * parent_ids_gpu = nullptr;    // [max_tree_tokens] i32 on GPU
+        std::vector<ggml_tensor *> ssm_intermediates; // per recurrent layer: [S_v*S_v*H*max_tokens] f16
+        int max_tree_tokens = 0;
+    } tree_bufs;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

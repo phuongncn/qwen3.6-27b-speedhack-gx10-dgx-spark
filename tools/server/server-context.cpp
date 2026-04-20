@@ -687,7 +687,7 @@ private:
 
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
-            params_dft.n_batch      = llama_n_ctx_seq(ctx);
+            params_dft.n_batch      = params_dft.n_ctx;
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams_dft;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;

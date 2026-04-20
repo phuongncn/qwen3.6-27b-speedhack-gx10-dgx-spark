@@ -1080,6 +1080,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "GATED_DELTA_NET_TREE",
+    "SSM_CONV_TREE",
     "TURBO_WHT",
 
     "UNARY",
@@ -6255,6 +6257,93 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_tree
+
+struct ggml_tensor * ggml_gated_delta_net_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * persist_inter) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(persist_inter->type == GGML_TYPE_F16);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(ggml_nelements(parent_ids) >= n_tokens);
+    GGML_ASSERT(ggml_nelements(persist_inter) >= S_v * S_v * H * n_tokens * n_seqs);
+
+    // output layout same as non-tree: [S_v*H, (n_tokens + S_v)*n_seqs]
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_TREE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = parent_ids;
+    result->src[7] = persist_inter;
+
+    return result;
+}
+
+// ggml_ssm_conv_tree
+
+struct ggml_tensor * ggml_ssm_conv_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * parent_ids) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1;
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[0] == d_conv - 1 + n_t);
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(n_t >= 0);
+    GGML_ASSERT(ggml_nelements(parent_ids) >= n_t);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV_TREE;
+    result->src[0] = sx;
+    result->src[1] = c;
+    result->src[2] = parent_ids;
 
     return result;
 }

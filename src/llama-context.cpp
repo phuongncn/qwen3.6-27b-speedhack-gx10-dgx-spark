@@ -1641,6 +1641,177 @@ void llama_context::clear_tree_mask() {
     tree_mask.visibility.clear();
 }
 
+void llama_context::set_tree_parent_ids(const int32_t * parents, int n_tokens) {
+    if (tree_bufs.max_tree_tokens == 0) {
+        // Allocate on first use with reasonable default
+        allocate_tree_buffers(32);
+    }
+    GGML_ASSERT(n_tokens <= tree_bufs.max_tree_tokens);
+    tree_bufs.n_tokens = n_tokens;
+    tree_bufs.active = true;
+
+    // Copy to CPU buffer
+    tree_bufs.parent_ids_cpu.assign(parents, parents + n_tokens);
+
+    // Upload to GPU
+    ggml_backend_tensor_set(tree_bufs.parent_ids_gpu, parents, 0, n_tokens * sizeof(int32_t));
+}
+
+void llama_context::clear_tree_parent_ids() {
+    tree_bufs.active = false;
+    tree_bufs.n_tokens = 0;
+}
+
+void llama_context::allocate_tree_buffers(int max_tree_tokens) {
+    if (tree_bufs.max_tree_tokens >= max_tree_tokens) {
+        return; // already allocated enough
+    }
+
+    // Free existing
+    if (tree_bufs.buffer) {
+        ggml_backend_buffer_free(tree_bufs.buffer);
+        tree_bufs.buffer = nullptr;
+    }
+    if (tree_bufs.ggml_ctx) {
+        ggml_free(tree_bufs.ggml_ctx);
+        tree_bufs.ggml_ctx = nullptr;
+    }
+
+    tree_bufs.max_tree_tokens = max_tree_tokens;
+    tree_bufs.ssm_intermediates.clear();
+
+    const auto & hparams = model.hparams;
+    const int64_t d_inner = hparams.ssm_d_inner;
+    const int64_t num_v_heads = hparams.ssm_dt_rank;
+    const int64_t head_v_dim = (num_v_heads > 0) ? d_inner / num_v_heads : 0;
+
+    if (head_v_dim == 0 || num_v_heads == 0) {
+        return; // not a hybrid model
+    }
+
+    // Count recurrent layers
+    int n_recurrent = 0;
+    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+        if (hparams.is_recurrent(i)) {
+            n_recurrent++;
+        }
+    }
+    if (n_recurrent == 0) return;
+
+    // Calculate total buffer size
+    // Per layer: [head_v_dim, head_v_dim, num_v_heads, max_tree_tokens] in f16
+    const int64_t inter_elems_per_layer = head_v_dim * head_v_dim * num_v_heads * max_tree_tokens;
+    const size_t inter_bytes_per_layer = inter_elems_per_layer * sizeof(ggml_fp16_t);
+    const size_t parent_ids_bytes = max_tree_tokens * sizeof(int32_t);
+    const size_t total_bytes = n_recurrent * inter_bytes_per_layer + parent_ids_bytes;
+
+    // Create ggml context for tensor metadata
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (n_recurrent + 1) + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    tree_bufs.ggml_ctx = ggml_init(params);
+
+    // Create tensors
+    tree_bufs.parent_ids_gpu = ggml_new_tensor_1d(tree_bufs.ggml_ctx, GGML_TYPE_I32, max_tree_tokens);
+    ggml_set_name(tree_bufs.parent_ids_gpu, "tree_parent_ids");
+
+    tree_bufs.ssm_intermediates.resize(n_recurrent);
+    for (int i = 0; i < n_recurrent; i++) {
+        // Flat 1D tensor for simplicity, reshape in graph building
+        tree_bufs.ssm_intermediates[i] = ggml_new_tensor_1d(tree_bufs.ggml_ctx, GGML_TYPE_F16, inter_elems_per_layer);
+        char name[64];
+        snprintf(name, sizeof(name), "tree_ssm_inter_%d", i);
+        ggml_set_name(tree_bufs.ssm_intermediates[i], name);
+    }
+
+    // Allocate GPU buffer
+    auto * buft = ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(sched.get(), 0));
+    tree_bufs.buffer = ggml_backend_alloc_ctx_tensors_from_buft(tree_bufs.ggml_ctx, buft);
+
+    if (!tree_bufs.buffer) {
+        LLAMA_LOG_ERROR("%s: failed to allocate tree verify buffers (%.1f MB)\n", __func__,
+                        total_bytes / (1024.0 * 1024.0));
+        tree_bufs.max_tree_tokens = 0;
+        ggml_free(tree_bufs.ggml_ctx);
+        tree_bufs.ggml_ctx = nullptr;
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: allocated tree verify buffers: %d layers × %d tokens = %.1f MB\n", __func__,
+                   n_recurrent, max_tree_tokens, total_bytes / (1024.0 * 1024.0));
+
+    tree_bufs.parent_ids_cpu.resize(max_tree_tokens);
+}
+
+void llama_context::tree_rollback(int commit_n, const int32_t * parents) {
+    if (!tree_bufs.active || commit_n < 0) return;
+
+    const auto & hparams = model.hparams;
+
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(get_memory());
+    llama_memory_recurrent * mem_recr = nullptr;
+    if (mem_hybrid) {
+        mem_recr = mem_hybrid->get_mem_recr();
+    } else {
+        mem_recr = dynamic_cast<llama_memory_recurrent *>(get_memory());
+    }
+    if (!mem_recr) return;
+
+    int32_t cell_idx = -1;
+    for (uint32_t i = 0; i < mem_recr->size; ++i) {
+        if (mem_recr->cells[i].has_seq_id(0)) {
+            cell_idx = (int32_t)i;
+            break;
+        }
+    }
+    if (cell_idx < 0) return;
+
+    const uint32_t n_embd_s = hparams.n_embd_s();
+    const uint32_t n_embd_r = hparams.n_embd_r();
+
+    // Pre-allocate scratch buffers outside the layer loop
+    std::vector<ggml_fp16_t> inter_f16(n_embd_s);
+    std::vector<float> state_f32(n_embd_s);
+    std::vector<float> zeros(n_embd_r, 0.0f);
+
+    int recurrent_idx = 0;
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (!hparams.is_recurrent(il)) continue;
+
+        ggml_tensor * inter = tree_bufs.ssm_intermediates[recurrent_idx];
+        size_t src_offset = (size_t)commit_n * n_embd_s * sizeof(ggml_fp16_t);
+
+        ggml_backend_tensor_get(inter, inter_f16.data(), src_offset, n_embd_s * sizeof(ggml_fp16_t));
+
+        for (uint32_t i = 0; i < n_embd_s; i++) {
+            state_f32[i] = ggml_fp16_to_fp32(inter_f16[i]);
+        }
+
+        ggml_tensor * s_tensor = mem_recr->s_l[il];
+        size_t s_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        ggml_backend_tensor_set(s_tensor, state_f32.data(), s_offset, n_embd_s * sizeof(float));
+
+        // Zero conv state — only d_conv-1=3 tokens of context, re-seeded on next decode
+        if (n_embd_r > 0) {
+            ggml_tensor * r_tensor = mem_recr->r_l[il];
+            size_t r_offset = (size_t)cell_idx * n_embd_r * ggml_element_size(r_tensor);
+            ggml_backend_tensor_set(r_tensor, zeros.data(), r_offset, n_embd_r * sizeof(float));
+        }
+
+        recurrent_idx++;
+    }
+
+    if (commit_n > 0) {
+        mem_recr->cells[cell_idx].pos += commit_n;
+    }
+
+    (void)parents;
+
+    clear_tree_parent_ids();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -2973,6 +3144,9 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
+        /*.tree_parent_ids         =*/ tree_bufs.active ? tree_bufs.parent_ids_gpu : nullptr,
+        /*.tree_ssm_intermediates  =*/ tree_bufs.active ? &tree_bufs.ssm_intermediates : nullptr,
+        /*.tree_n_recurrent_layers =*/ (int)tree_bufs.ssm_intermediates.size(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4000,6 +4174,22 @@ void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_
 
 void llama_clear_tree_mask(llama_context * ctx) {
     ctx->clear_tree_mask();
+}
+
+void llama_set_tree_parent_ids(llama_context * ctx, const int32_t * parents, int n_tokens) {
+    ctx->set_tree_parent_ids(parents, n_tokens);
+}
+
+void llama_clear_tree_parent_ids(llama_context * ctx) {
+    ctx->clear_tree_parent_ids();
+}
+
+void llama_allocate_tree_buffers(llama_context * ctx, int max_tree_tokens) {
+    ctx->allocate_tree_buffers(max_tree_tokens);
+}
+
+void llama_tree_rollback(llama_context * ctx, int commit_n, const int32_t * parents) {
+    ctx->tree_rollback(commit_n, parents);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

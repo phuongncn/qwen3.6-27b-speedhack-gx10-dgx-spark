@@ -550,6 +550,11 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_tree_mask        * tree_mask = nullptr;
 
+    // DDTree: tree-mode SSM buffers (parent_ids + persistent intermediates)
+    ggml_tensor * tree_parent_ids = nullptr;
+    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
+    int tree_n_recurrent_layers = 0;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -635,7 +640,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            (tree_parent_ids != nullptr) == (other.tree_parent_ids != nullptr);
     }
 };
 
@@ -762,6 +768,11 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_tree_mask        * tree_mask;
+
+    // DDTree: tree-mode SSM buffers
+    ggml_tensor * tree_parent_ids = nullptr;
+    const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
+    int tree_n_recurrent_layers = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
