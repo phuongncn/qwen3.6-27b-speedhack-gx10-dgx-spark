@@ -857,7 +857,7 @@ int32_t llama_context::get_logits_argmax_k() {
 
 float * llama_context::get_logits_argmax_probs() {
     synchronize();
-    if (logits_argmax_prob_buf.empty() || cparams.dflash_sample_temp <= 0.0f) {
+    if (logits_argmax_prob_buf.empty()) {
         return nullptr;
     }
     return logits_argmax_prob_buf.data();
@@ -1658,9 +1658,9 @@ void llama_context::clear_tree_mask() {
 }
 
 void llama_context::set_tree_parent_ids(const int32_t * parents, int n_tokens) {
-    if (tree_bufs.max_tree_tokens == 0) {
-        // Allocate on first use — round up to accommodate future calls
-        int alloc_size = std::max(n_tokens, 32);
+    if (tree_bufs.max_tree_tokens < n_tokens) {
+        // Allocate or reallocate — use exact size + small margin
+        int alloc_size = n_tokens + 4;
         allocate_tree_buffers(alloc_size);
     }
     GGML_ASSERT(n_tokens <= tree_bufs.max_tree_tokens);
@@ -1912,9 +1912,13 @@ void llama_context::tree_rollback(int commit_n, const int32_t * parents) {
         }
     }
 
-    // Set cell.pos to reflect the last accepted token's position
-    // After verify: cell.pos = base + N - 1. We want: base + commit_n.
-    mem_recr->cells[cell_idx].pos -= (tree_bufs.n_tokens - 1 - commit_n);
+    // Set cell.pos to the target position (absolute, set by caller via set_tree_seq0_count).
+    // In tree mode, prepare() sets cell.pos to last ubatch position which is unpredictable
+    // (branches may be last). So we use the absolute target: n_past_before + commit_n.
+    const int target_pos = tree_bufs.n_seq0_tokens; // repurposed: caller passes absolute target pos
+    if (target_pos >= 0) {
+        mem_recr->cells[cell_idx].pos = target_pos;
+    }
 
     clear_tree_parent_ids();
 }
@@ -4307,7 +4311,8 @@ void llama_allocate_tree_buffers(llama_context * ctx, int max_tree_tokens) {
     ctx->allocate_tree_buffers(max_tree_tokens);
 }
 
-void llama_tree_rollback(llama_context * ctx, int commit_n, const int32_t * parents) {
+void llama_tree_rollback(llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0) {
+    ctx->set_tree_seq0_count(n_seq0);
     ctx->tree_rollback(commit_n, parents);
 }
 

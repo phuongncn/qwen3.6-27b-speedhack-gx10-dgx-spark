@@ -385,6 +385,7 @@ public:
 
     // DDTree: rollback SSM state to accepted token from intermediates
     void tree_rollback(int commit_n, const int32_t * parents);
+    void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
 
 private:
     llm_graph_params graph_params(
@@ -465,6 +466,7 @@ private:
     struct {
         bool active = false;
         int n_tokens = 0;
+        int n_seq0_tokens = 0;                     // tokens on seq_id=0 in last batch (for pos rollback)
         std::vector<int32_t> parent_ids_cpu;       // [max_tree_tokens] host copy
         ggml_backend_buffer_t buffer = nullptr;    // GPU allocation for all intermediates + parent_ids
         ggml_context * ggml_ctx = nullptr;         // context owning tensor metadata

@@ -138,11 +138,9 @@ int main(int argc, char ** argv) {
     llama_context * ctx_tgt = NULL;
 
     // speculative decoding with recurrent/hybrid models needs seq_backup=1 for state rollback
-    // DDTree additionally needs seq_branch=2 for branch KV entries
     {
-        const int min_seqs = (params.speculative.tree_budget > 0) ? 3 : 2;
-        if (params.n_parallel < min_seqs) {
-            params.n_parallel = min_seqs;
+        if (params.n_parallel < 2) {
+            params.n_parallel = 2;
         }
     }
 
@@ -242,7 +240,6 @@ int main(int argc, char ** argv) {
     const bool needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     // backup sequence ID for saving recurrent state before speculative batches
     const llama_seq_id seq_backup = 1;
-    const llama_seq_id seq_branch = 2; // DDTree: branch tokens separate from main chain
 
     // ================================================
     // everything until here is standard initialization
@@ -349,12 +346,11 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // Single-pass tree verify: batch ALL tree nodes with tree mask + parent_ids
-                // Main chain (chain-seed backbone) on seq_id=0, branches on seq_branch
-                // This allows cheap KV cleanup after acceptance (no re-decode needed)
+                // All tokens on seq_id=0 so ubatch allocator keeps them together for GDN kernel.
+                // KV cleanup uses backup-restore path (branches share positions with main chain).
                 common_batch_add(batch_tgt, id_last, n_past++, {0}, true);
                 for (int i = 0; i < tree.n_nodes; ++i) {
-                    llama_seq_id sid = (i < tree.main_path_len) ? 0 : seq_branch;
-                    common_batch_add(batch_tgt, tree.tokens[i], n_past - 1 + tree.depths[i], {sid}, true);
+                    common_batch_add(batch_tgt, tree.tokens[i], n_past - 1 + tree.depths[i], {0}, true);
                 }
 
                 n_draft_this_iter = tree.n_nodes;
@@ -562,33 +558,34 @@ int main(int argc, char ** argv) {
 
         if (has_backup && !has_eos) {
             if (tree_budget > 0) {
-                // DDTree rollback: tree_rollback for SSM state, seq_rm for KV cache
+                // DDTree rollback: tree_rollback for SSM state, backup-restore for KV cache
                 const int n_past_before = n_past - (int)ids.size();
-                const int accepted_len = (int)ids.size(); // includes bonus token
                 auto * mem = llama_get_memory(ctx_tgt);
 
                 // tree_rollback: restore SSM state from f16 intermediates + conv from tape
+                // Target pos = n_past_before + depth of committed node
+                const int commit_depth = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
                 {
                     common_time_meas tm(t_restore_total);
-                    llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data());
+                    llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data(), n_past_before + commit_depth);
                 }
 
-                // KV cache cleanup via seq_rm (no re-decode needed)
+                // KV cache cleanup
                 {
                     common_time_meas tm(t_decode2_total);
+                    const int n_branches = tree.n_nodes - tree.main_path_len;
+                    const bool all_accepted = (commit_depth == tree.main_path_len);
 
-                    if (accepted_on_main_path) {
-                        // Fast path: accepted tokens are all on seq_id=0
-                        // Remove all branch KV entries
-                        llama_memory_seq_rm(mem, seq_branch, -1, -1);
-                        // Remove rejected main chain tail (keep positions through last accepted depth)
-                        llama_memory_seq_rm(mem, 0, n_past_before + accepted_len, -1);
-                        // Remove backup
+                    if (n_branches == 0 && accepted_on_main_path) {
+                        // Fast path: no branches, just trim rejected tail from KV
+                        if (!all_accepted) {
+                            llama_memory_seq_rm(mem, 0, n_past_before + commit_depth + 1, -1);
+                        }
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        n_reeval_skipped++;
                     } else {
-                        // Rare: accepted path diverged onto a branch
-                        // Fall back to backup restore + re-decode for the branch tokens
-                        llama_memory_seq_rm(mem, seq_branch, -1, -1);
+                        // Slow path: branches create position collisions on seq 0.
+                        // Backup-restore + re-decode accepted tokens.
                         llama_memory_seq_rm(mem, 0, n_past_before, -1);
                         llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);

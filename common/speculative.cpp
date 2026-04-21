@@ -1350,12 +1350,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
         {
             int32_t * argmax = llama_get_logits_argmax(ctx_dft);
             float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+            const int K_flat = llama_get_logits_argmax_k(ctx_dft);
             if (argmax) {
                 // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
                 for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
-                    result.push_back((llama_token) argmax[i]);
+                    result.push_back((llama_token) argmax[i * K_flat]);
                     if (draft_log_probs && argmax_probs) {
-                        draft_log_probs->push_back(argmax_probs[i]);
+                        draft_log_probs->push_back(argmax_probs[i * K_flat]);
                     }
                 }
             } else {
@@ -1442,9 +1443,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
         const int K = llama_get_logits_argmax_k(ctx_dft);
-        GGML_UNUSED(llama_get_logits_argmax_probs(ctx_dft)); // available for log-prob branch scoring
+        float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
 
-        // Build tree from GPU top-K tokens
+        // Build tree using best-first heap expansion with chain-seed backbone
         tree.tokens.clear();
         tree.parents.clear();
         tree.depths.clear();
@@ -1456,11 +1457,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         tree.n_nodes = 0;
         tree.main_path_len = 0;
 
-        // Main path: top-1 (argmax) at each depth
+        // Chain-seed: pre-insert greedy backbone (top-1 at each depth)
         {
             int parent = 0;
             for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
-                llama_token token_id = (llama_token) argmax[d * K]; // first of K candidates at batch pos d
+                llama_token token_id = (llama_token) argmax[d * K];
 
                 int current_idx = tree.n_nodes + 1;
                 tree.tokens.push_back(token_id);
@@ -1475,16 +1476,67 @@ struct common_speculative_state_dflash : public common_speculative_state {
             tree.main_path_len = tree.n_nodes;
         }
 
-        // Phase 2: branching — add alternative candidates from top-K at each depth
-        if (K > 1 && tree.n_nodes < tree_budget) {
-            // Walk main path, at each depth add K-1 branches (siblings)
+        // Best-first expansion using log-prob heap (DDTree Algorithm 1)
+        if (K > 1 && tree.n_nodes < tree_budget && argmax_probs) {
+            // Heap entry: (cumulative_log_prob, parent_tree_idx, depth, rank)
+            struct heap_entry {
+                float  log_w;
+                int    parent_idx;
+                int    depth;  // 1-based position in draft sequence
+                int    rank;   // rank within top-K at this depth
+                bool operator<(const heap_entry & o) const { return log_w < o.log_w; }
+            };
+
+            std::priority_queue<heap_entry> heap;
+
+            // Seed heap: siblings of the main chain at each depth
+            // cumulative log-prob along main path up to parent
+            float cum_log_prob = 0.0f;
+            int main_parent = 0;
+            for (int d = 1; d <= depth_limit; ++d) {
+                float sibling_lp = cum_log_prob + argmax_probs[d * K + 1];
+                heap.push({sibling_lp, main_parent, d, 1});
+                cum_log_prob += argmax_probs[d * K + 0];
+                main_parent = d; // main path nodes are 1-indexed
+            }
+
+            while (!heap.empty() && tree.n_nodes < tree_budget) {
+                auto top = heap.top();
+                heap.pop();
+
+                llama_token token_id = (llama_token) argmax[top.depth * K + top.rank];
+                if (token_id < 0) continue;
+                if (tree.child_maps[top.parent_idx].count(token_id)) continue;
+
+                int current_idx = tree.n_nodes + 1;
+                tree.tokens.push_back(token_id);
+                tree.parents.push_back(top.parent_idx);
+                tree.depths.push_back(top.depth);
+                tree.child_maps.push_back({});
+                tree.child_maps[top.parent_idx][token_id] = current_idx;
+                tree.n_nodes++;
+
+                // Push sibling: same depth, next rank
+                if (top.rank + 1 < K) {
+                    float sib_lp = top.log_w - argmax_probs[top.depth * K + top.rank]
+                                             + argmax_probs[top.depth * K + top.rank + 1];
+                    heap.push({sib_lp, top.parent_idx, top.depth, top.rank + 1});
+                }
+
+                // Push child: extend this branch one depth deeper (rank 0)
+                if (top.depth < depth_limit) {
+                    int child_depth = top.depth + 1;
+                    float child_lp = top.log_w + argmax_probs[child_depth * K + 0];
+                    heap.push({child_lp, current_idx, child_depth, 0});
+                }
+            }
+        } else if (K > 1 && tree.n_nodes < tree_budget) {
+            // Fallback without log-probs: uniform sibling addition
             int main_parent = 0;
             for (int d = 1; d <= depth_limit && tree.n_nodes < tree_budget; ++d) {
                 for (int ki = 1; ki < K && tree.n_nodes < tree_budget; ++ki) {
                     llama_token alt_token = (llama_token) argmax[d * K + ki];
-                    if (alt_token < 0) continue; // invalid slot
-
-                    // skip if same as main path token at this depth
+                    if (alt_token < 0) continue;
                     if (tree.child_maps[main_parent].count(alt_token)) continue;
 
                     int current_idx = tree.n_nodes + 1;
@@ -1495,8 +1547,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
                     tree.child_maps[main_parent][alt_token] = current_idx;
                     tree.n_nodes++;
                 }
-                // advance main_parent along main path
-                main_parent = d; // main path nodes are 1-indexed sequentially
+                main_parent = d;
             }
         }
 

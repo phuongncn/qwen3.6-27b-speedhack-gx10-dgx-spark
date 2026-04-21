@@ -1116,7 +1116,7 @@ extern "C" {
     LLAMA_API void llama_allocate_tree_buffers(struct llama_context * ctx, int max_tree_tokens);
 
     // DDTree: rollback SSM state to committed token using stored intermediates
-    LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents);
+    LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
 
     // DFlash: share tok_embd and output tensors from src model to dst model
     // Used to avoid duplicating embedding/lm_head weights between target and drafter
