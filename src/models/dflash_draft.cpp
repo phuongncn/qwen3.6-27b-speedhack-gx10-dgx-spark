@@ -105,9 +105,10 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // --- Embedding ---
     // tok_embd/output may be nullptr during graph reservation (shared from target at runtime)
+    // Use Q4_0 placeholder to avoid 4.8 GB F32 allocation during reservation
     ggml_tensor * tok_embd_use = model.tok_embd;
     if (!tok_embd_use) {
-        tok_embd_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, model.vocab.n_tokens());
+        tok_embd_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q4_0, n_embd, model.vocab.n_tokens());
     }
     ggml_tensor * inpL = build_inp_embd(tok_embd_use);
 
@@ -220,9 +221,10 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     res->t_embd = cur;
 
     // lm_head — may be nullptr during reservation (shared from target at runtime)
+    // Use Q4_0 placeholder to avoid 4.8 GB F32 allocation during reservation
     ggml_tensor * output_use = model.output;
     if (!output_use) {
-        output_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, model.vocab.n_tokens());
+        output_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q4_0, n_embd, model.vocab.n_tokens());
     }
     cur = build_lora_mm(output_use, cur);
     cb(cur, "result_output", -1);
