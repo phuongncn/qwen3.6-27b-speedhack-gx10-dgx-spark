@@ -903,6 +903,25 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+
+        // Apply DFlash-safe defaults for memory-heavy knobs the user didn't touch.
+        // The drafter's block size is 16, and its max internal batch is 64, so the
+        // llama.cpp stock defaults (n_batch=2048, n_ubatch=512) allocate far more
+        // KV/activation memory than DFlash can use and commonly OOM on first run.
+        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (params.n_batch == params_org.n_batch && params.n_batch > 256) {
+                LOG_INF("dflash: capping -b from %d to 256 (drafter block_size=16; pass -b N to override)\n", params.n_batch);
+                params.n_batch = 256;
+            }
+            if (params.n_ubatch == params_org.n_ubatch && params.n_ubatch > 64) {
+                LOG_INF("dflash: capping -ub from %d to 64 (drafter block_size=16; pass -ub N to override)\n", params.n_ubatch);
+                params.n_ubatch = 64;
+            }
+            if (params.speculative.n_ctx == params_org.speculative.n_ctx && params.speculative.n_ctx == 0) {
+                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
+                params.speculative.n_ctx = 256;
+            }
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
