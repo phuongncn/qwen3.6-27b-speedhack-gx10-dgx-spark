@@ -509,7 +509,7 @@ static __device__ __forceinline__ float fwht128_butterfly_inplace(float val, flo
     // Intra-warp passes: shuffle xor with stride h, no smem, no sync.
     #pragma unroll
     for (int h = 1; h <= 16; h *= 2) {
-        const float other = __shfl_xor_sync(0xFFFFFFFF, val, h);
+        const float other = __shfl_xor_sync(0xFFFFFFFFULL, val, h);
         val = (tid & h) ? (other - val) : (val + other);
     }
 
@@ -533,7 +533,7 @@ static __device__ __forceinline__ float fwht128_butterfly_inplace(float val, flo
 static __device__ __forceinline__ void fwht128_store_half(
         float val, half * dst_base) {
     const int tid = threadIdx.x;
-    const float neighbor = __shfl_xor_sync(0xFFFFFFFF, val, 1);
+    const float neighbor = __shfl_xor_sync(0xFFFFFFFFULL, val, 1);
     if ((tid & 1) == 0) {
         const half2 packed = __floats2half2_rn(val, neighbor);
         *((half2 *)(dst_base + tid)) = packed;
