@@ -620,7 +620,7 @@ int main(int argc, char ** argv) {
 
                     {
                         common_time_meas tm(t_decode2_total);
-                        llama_dflash_rollback(ctx_tgt, seq_backup, n_past_before, (int)ids.size());
+                        llama_dflash_rollback(ctx_tgt, 0, seq_backup, n_past_before, (int)ids.size());
                     }
 
                     n_reeval_tokens += (int)ids.size();
