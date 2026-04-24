@@ -50,6 +50,11 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
+// [CHECKPOINT B1.3] inform the speculative stack which server slot (seq_id on
+// ctx_tgt and the shared ctx_dft) this instance services. Safe to call multiple
+// times; no-op for non-DFlash impls.
+void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
+
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,

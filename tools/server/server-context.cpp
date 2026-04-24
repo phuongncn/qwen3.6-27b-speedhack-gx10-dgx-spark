@@ -861,6 +861,9 @@ private:
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
                         return false;
                     }
+                    // [CHECKPOINT B1.3] DFlash: tag every drafter call from this slot
+                    // with its own seq_id so the shared ctx_dft routes cross-data per slot.
+                    common_speculative_set_seq_id(slot.spec, slot.id);
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
                 } else {
                     SLT_INF(slot, "%s", "speculative decoding context not initialized\n");

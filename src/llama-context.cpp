@@ -1746,21 +1746,16 @@ void llama_context::set_cross_data_seq(llama_seq_id seq_id, const float * data, 
         set_cross_data(data, n_embd, n_tokens);
         return;
     }
-    const int64_t bucket = cross_bucket(n_tokens);
 
-    // n_embd / n_enc on the top-level cross struct still drive graph shape, so keep
-    // them in sync. If the bucket grew, the next graph build needs reservation.
-    if (cross.n_enc != bucket) {
-        sched_need_reserve = true;
-    }
-    cross.n_embd     = n_embd;
-    cross.n_enc      = bucket;
-    cross.n_enc_real = n_tokens;
+    // Always update the single-slot v_embd too — until B2 widens the drafter graph
+    // to read v_embd_per_seq, the graph still pulls from v_embd, and sequential
+    // draft() calls rely on the just-set data being there.
+    set_cross_data(data, n_embd, n_tokens);
 
     auto & entry = cross.v_embd_per_seq[seq_id];
-    entry.n_enc      = bucket;
-    entry.n_enc_real = n_tokens;
-    entry.v_embd.resize(n_embd * bucket);
+    entry.n_enc      = cross.n_enc;
+    entry.n_enc_real = cross.n_enc_real;
+    entry.v_embd.resize(n_embd * cross.n_enc);
     if (data) {
         memcpy(entry.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
     }

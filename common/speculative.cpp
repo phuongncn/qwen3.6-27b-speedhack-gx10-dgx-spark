@@ -205,6 +205,11 @@ struct common_speculative_state {
     // batch_tokens: tokens that were in the batch [id_last, draft0, draft1, ...]
     // n_accepted: how many were accepted (ids.size(), including the bonus token)
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
+
+    // [CHECKPOINT B1.3] DFlash multi-slot: identify which slot (seq_id on both ctx_tgt
+    // and the shared ctx_dft) this state owns. Default is 0 — legacy single-slot value.
+    // Non-DFlash impls ignore this.
+    virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -1218,6 +1223,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     llama_context * ctx_dft;
     llama_model   * model_dft;
     bool            owns_ctx_dft; // when false, ctx_dft is externally owned (shared across slots)
+    llama_seq_id    seq_id = 0;   // [CHECKPOINT B1.3] which server slot this state owns
 
     int block_size;
     llama_token mask_token_id;
@@ -1287,6 +1293,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
     }
 
+    void set_seq_id(llama_seq_id seq_id_) override {
+        seq_id = seq_id_;
+    }
+
     // called after initial prefill — extract hidden states from target
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
@@ -1327,17 +1337,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t1 = ggml_time_us();
 
-        // set cross data on drafter context
-        llama_set_cross_data(ctx_dft, cross_buf.data(), n_target_features, cross_len);
+        // [CHECKPOINT B1.3] set cross data keyed by this slot's seq_id. Until B2 widens
+        // the drafter graph to read v_embd_per_seq, the per-seq impl also updates the
+        // top-level v_embd so the graph's existing read path still sees fresh data.
+        llama_set_cross_data_seq(ctx_dft, seq_id, cross_buf.data(), n_target_features, cross_len);
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
         // positions are relative to the context window fed to the drafter
         // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
         const int batch_len = n_draft + 1;
         common_batch_clear(batch_dft);
-        common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
+        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
         for (int i = 1; i < batch_len; ++i) {
-            common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
+            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
         }
 
         const int64_t t2 = ggml_time_us();
@@ -1423,12 +1435,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const float * cross_data = cross_buf.data();
 
-        llama_set_cross_data(ctx_dft, cross_data, n_target_features, cross_len);
+        // [CHECKPOINT B1.3] per-seq cross data + batch tagging (see draft()).
+        llama_set_cross_data_seq(ctx_dft, seq_id, cross_data, n_target_features, cross_len);
 
         common_batch_clear(batch_dft);
-        common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
+        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
         for (int i = 1; i < block_size; ++i) {
-            common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
+            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
         }
 
         int ret = llama_decode(ctx_dft, batch_dft);
@@ -2033,6 +2046,17 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(prompt);
         impl->n_call_begin++;
+    }
+}
+
+// [CHECKPOINT B1.3] wire the server slot's seq_id into every impl state.
+// DFlash uses it to route cross-data and batch tags; others ignore it.
+void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_seq_id(seq_id);
     }
 }
 
