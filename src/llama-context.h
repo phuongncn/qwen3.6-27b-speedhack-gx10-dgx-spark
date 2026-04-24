@@ -409,6 +409,11 @@ public:
     // DFlash: set cross data for drafter context
     void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // DFlash multi-slot: stash cross data keyed by seq_id. Multiple slots can
+    // each set their own buffer before a batched drafter decode. seq_id < 0
+    // routes to the legacy single-slot path (set_cross_data).
+    void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+
     // DDTree: set/clear tree attention mask for verification
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();

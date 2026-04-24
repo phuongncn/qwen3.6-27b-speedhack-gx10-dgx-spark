@@ -1740,6 +1740,32 @@ void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n
     // padding beyond n_tokens is masked with -inf in set_input, no need to zero-fill
 }
 
+// [CHECKPOINT B1.2] per-seq cross data stash — multi-slot DFlash support
+void llama_context::set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
+    if (seq_id < 0) {
+        set_cross_data(data, n_embd, n_tokens);
+        return;
+    }
+    const int64_t bucket = cross_bucket(n_tokens);
+
+    // n_embd / n_enc on the top-level cross struct still drive graph shape, so keep
+    // them in sync. If the bucket grew, the next graph build needs reservation.
+    if (cross.n_enc != bucket) {
+        sched_need_reserve = true;
+    }
+    cross.n_embd     = n_embd;
+    cross.n_enc      = bucket;
+    cross.n_enc_real = n_tokens;
+
+    auto & entry = cross.v_embd_per_seq[seq_id];
+    entry.n_enc      = bucket;
+    entry.n_enc_real = n_tokens;
+    entry.v_embd.resize(n_embd * bucket);
+    if (data) {
+        memcpy(entry.v_embd.data(), data, n_embd * n_tokens * sizeof(float));
+    }
+}
+
 void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens) {
     tree_mask.active = true;
     tree_mask.n_tree_tokens = n_tree_tokens;
@@ -4419,6 +4445,10 @@ void llama_dflash_prepare_branch(llama_context * ctx, llama_seq_id seq_id, llama
 
 void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {
     ctx->set_cross_data(data, n_embd, n_tokens);
+}
+
+void llama_set_cross_data_seq(llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
+    ctx->set_cross_data_seq(seq_id, data, n_embd, n_tokens);
 }
 
 void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {

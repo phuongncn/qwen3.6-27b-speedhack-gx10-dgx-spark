@@ -1114,6 +1114,11 @@ extern "C" {
     // data: float[n_embd * n_tokens], n_embd: feature dimension, n_tokens: context length
     LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // Multi-slot variant: stashes cross data keyed by seq_id so multiple slots can
+    // each set their own buffer before a batched drafter decode. seq_id < 0 routes
+    // to the single-slot path (same as llama_set_cross_data).
+    LLAMA_API void llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend
     // n_tree_tokens: number of tokens in the tree batch (root + nodes)
