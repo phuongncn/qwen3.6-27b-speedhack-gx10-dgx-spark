@@ -2810,10 +2810,6 @@ private:
 
             const int ret = llama_decode(ctx, batch_view);
 
-            if (dflash_tape_active) {
-                llama_set_tape_recording(ctx, false);
-            }
-
             metrics.on_decoded(slots);
 
             if (ret != 0) {
@@ -3098,6 +3094,15 @@ private:
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
+        }
+
+        // turn off DFlash tape recording after all sub-batches — was turned on
+        // before the sub-batch for loop. Placing it outside the loop (vs inside,
+        // after the first decode) keeps recording active across all sub-batches,
+        // which matters when multiple slots share one pass and the combined
+        // verify batch spans more than one ubatch.
+        if (dflash_tape_active) {
+            llama_set_tape_recording(ctx, false);
         }
 
         SRV_DBG("%s", "run slots completed\n");
