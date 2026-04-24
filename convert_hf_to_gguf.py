@@ -1536,6 +1536,9 @@ class TextModel(ModelBase):
         if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
             # ref: https://huggingface.co/z-lab/Qwen3.5-27B-DFlash (uses Qwen3.5 tokenizer)
             res = "qwen35"
+        if chkhsh == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945":
+            # ref: https://huggingface.co/Qwen/Qwen3.6-35B-A3B (identical pre-tokenizer regex to qwen35)
+            res = "qwen35"
         if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
             # ref: https://huggingface.co/jdopensource/JoyAI-LLM-Flash
             res = "joyai-llm"
@@ -4738,10 +4741,14 @@ class DFlashDraftModel(TextModel):
         block_size = self.hparams.get("block_size", 16)
         self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)
 
-        mask_token_id = self.hparams.get("mask_token_id", 248070)
+        # newer drafters nest dflash-specific fields under "dflash_config"; fall back to top-level for older ones
+        dflash_cfg = self.hparams.get("dflash_config", {})
+
+        mask_token_id = dflash_cfg.get("mask_token_id", self.hparams.get("mask_token_id", 248070))
         self.gguf_writer.add_uint32(f"{arch}.dflash.mask_token_id", mask_token_id)
 
-        target_layer_ids = self.hparams.get("target_layer_ids", [1, 16, 31, 46, 61])
+        target_layer_ids = dflash_cfg.get("target_layer_ids",
+                                          self.hparams.get("target_layer_ids", [1, 16, 31, 46, 61]))
         self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)
 
         n_embd = self.hparams.get("hidden_size", 5120)
