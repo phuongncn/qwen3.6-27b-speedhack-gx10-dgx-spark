@@ -911,17 +911,32 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         // from hitting OOM. The tradeoff: target prefill is ~30% slower at
         // ub=64 vs ub=512. Users who want faster prefill pass -ub explicitly
         // (and can also pass -b to keep -b >= -ub).
+        // We scan argv instead of comparing to params_org because the stock
+        // default is 2048 — a user passing `-b 2048` to lift the cap would
+        // look identical to not passing anything with a naive value check.
         if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            if (params.speculative.n_ctx == params_org.speculative.n_ctx && params.speculative.n_ctx == 0) {
+            auto arg_passed = [argc, argv](std::initializer_list<const char *> names) {
+                for (int i = 1; i < argc; ++i) {
+                    for (const char * n : names) {
+                        if (strcmp(argv[i], n) == 0) return true;
+                    }
+                }
+                return false;
+            };
+            const bool b_passed   = arg_passed({"-b", "--batch-size"});
+            const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
+            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
+
+            if (!cd_passed && params.speculative.n_ctx == 0) {
                 LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
                 params.speculative.n_ctx = 256;
             }
             bool capped = false;
-            if (params.n_batch == params_org.n_batch && params.n_batch > 256) {
+            if (!b_passed && params.n_batch > 256) {
                 params.n_batch = 256;
                 capped = true;
             }
-            if (params.n_ubatch == params_org.n_ubatch && params.n_ubatch > 64) {
+            if (!ub_passed && params.n_ubatch > 64) {
                 params.n_ubatch = 64;
                 capped = true;
             }
