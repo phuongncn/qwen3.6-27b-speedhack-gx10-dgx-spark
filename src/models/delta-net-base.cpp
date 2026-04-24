@@ -430,9 +430,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
+    const int64_t n_seqs_in    = q->ne[3];
 
-    // Tree-mode: use tree-aware kernel when parent_ids are set and multi-token batch
-    if (tree_parent_ids && n_seq_tokens > 1 && tree_ssm_intermediates &&
+    // Tree-mode: use tree-aware kernel when parent_ids are set and multi-token batch.
+    // Only supported for single-seq batches — the persist_inter scratch and the
+    // parent_ids tensor are sized for one sequence, so multi-seq batches (e.g.
+    // llama-server with multiple DFlash slots verifying concurrently) would overflow
+    // the scratch. Multi-seq falls through to the fused/chunked paths below.
+    if (tree_parent_ids && n_seq_tokens > 1 && n_seqs_in == 1 && tree_ssm_intermediates &&
         n_seq_tokens <= ggml_nelements(tree_parent_ids)) {
         // Find the recurrent layer index for this model layer
         int recurrent_idx = 0;
