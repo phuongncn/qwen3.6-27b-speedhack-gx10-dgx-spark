@@ -68,7 +68,18 @@ struct llama_cross {
     int64_t n_enc_real = 0; // actual data length (unpadded)
 
     // embeddings data copied to host memory (tmp)
+    // Single-slot / encoder-decoder path: graph builders read from here directly.
     std::vector<float> v_embd;
+
+    // [CHECKPOINT B1.1] per-seq cross buffers for DFlash multi-slot.
+    // When non-empty, graph builders should pack these into target_hidden per slot
+    // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
+    struct seq_cross {
+        int64_t n_enc      = 0;  // padded length (graph stability)
+        int64_t n_enc_real = 0;  // actual data length
+        std::vector<float> v_embd;
+    };
+    std::map<llama_seq_id, seq_cross> v_embd_per_seq;
 
     // needed to construct the cross-attention mask in the decoder
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
