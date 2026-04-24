@@ -1056,12 +1056,12 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
         }
 
-        /* TODO: test this properly */
         inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
 
-        if ( inputs.enable_thinking ) {
-            throw std::invalid_argument("Assistant response prefill is incompatible with enable_thinking.");
-        }
+        // Upstream guarded against assistant prefill + enable_thinking with a
+        // blanket error, but harnesses that track thinking tokens themselves
+        // (hermes, etc.) drive prefill-to-continue for thinking-only responses
+        // and need both on at once. Experimental fork: allow it.
 
         inputs.add_generation_prompt = true;
     }
