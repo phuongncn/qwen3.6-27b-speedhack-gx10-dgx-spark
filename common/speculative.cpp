@@ -1217,6 +1217,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_dft;
     llama_model   * model_dft;
+    bool            owns_ctx_dft; // when false, ctx_dft is externally owned (shared across slots)
 
     int block_size;
     llama_token mask_token_id;
@@ -1246,11 +1247,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
     common_speculative_state_dflash(
             llama_context * ctx_tgt_,
             llama_context * ctx_dft_,
-            llama_model   * model_dft_)
+            llama_model   * model_dft_,
+            bool            owns_ctx_dft_ = true)
         : common_speculative_state(COMMON_SPECULATIVE_TYPE_DFLASH)
         , ctx_tgt(ctx_tgt_)
         , ctx_dft(ctx_dft_)
         , model_dft(model_dft_)
+        , owns_ctx_dft(owns_ctx_dft_)
     {
         block_size        = llama_model_dflash_block_size(model_dft_);
         mask_token_id     = (llama_token) llama_model_dflash_mask_token_id(model_dft_);
@@ -1279,7 +1282,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     ~common_speculative_state_dflash() override {
         llama_batch_free(batch_dft);
-        llama_free(ctx_dft);
+        if (owns_ctx_dft) {
+            llama_free(ctx_dft);
+        }
     }
 
     // called after initial prefill — extract hidden states from target
@@ -1762,24 +1767,41 @@ done:
 
 // initialization of the speculative decoding system
 //
+// [CHECKPOINT B0.1] ctx_dft factory (shared-ownership foundation)
+llama_context * common_speculative_create_ctx_dft(common_params_speculative & params) {
+    if (!params.model_dft) {
+        return nullptr;
+    }
+    llama_context * ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+    if (ctx_dft == nullptr) {
+        LOG_ERR("%s", "failed to create draft context\n");
+        return nullptr;
+    }
+    // Set topk/temp BEFORE first decode (graph reservation caches topology on K=1 shape,
+    // but we need to invalidate so the actual decode rebuilds with correct K)
+    if (params.draft_topk > 1) {
+        llama_set_dflash_topk(ctx_dft, params.draft_topk);
+        LOG_INF("dflash: top-K=%d enabled for tree branching\n", params.draft_topk);
+    }
+    if (params.sample_temp > 0.0f) {
+        llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
+    }
+    return ctx_dft;
+}
+
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
-    llama_context * ctx_dft = nullptr;
-    if (params.model_dft) {
-        ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+        llama_context             * ctx_tgt,
+        llama_context             * ctx_dft_shared) {
+    // [CHECKPOINT B0.2] external ctx_dft path
+    // When ctx_dft_shared is provided, we use it non-owning so multiple
+    // common_speculative instances can share one drafter context.
+    const bool owns_ctx_dft = (ctx_dft_shared == nullptr);
+    llama_context * ctx_dft = ctx_dft_shared;
+    if (ctx_dft == nullptr && params.model_dft) {
+        ctx_dft = common_speculative_create_ctx_dft(params);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s", "failed to create draft context\n");
             return nullptr;
-        }
-        // Set topk/temp BEFORE first decode (graph reservation caches topology on K=1 shape,
-        // but we need to invalidate so the actual decode rebuilds with correct K)
-        if (params.draft_topk > 1) {
-            llama_set_dflash_topk(ctx_dft, params.draft_topk);
-            LOG_INF("dflash: top-K=%d enabled for tree branching\n", params.draft_topk);
-        }
-        if (params.sample_temp > 0.0f) {
-            llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
         }
     }
 
@@ -1871,9 +1893,12 @@ common_speculative * common_speculative_init(
                 impls.push_back(std::make_unique<common_speculative_state_dflash>(
                     ctx_tgt,
                     ctx_dft,
-                    params.model_dft
+                    params.model_dft,
+                    owns_ctx_dft
                 ));
-                ctx_dft = nullptr; // ownership transferred
+                if (owns_ctx_dft) {
+                    ctx_dft = nullptr; // ownership transferred to the state
+                }
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT: {

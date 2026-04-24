@@ -32,9 +32,18 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // note: clears the memory of the context
 bool common_speculative_is_compat(llama_context * ctx_tgt);
 
+// Create a drafter context that can be shared across multiple common_speculative
+// instances (DFlash multi-slot). The caller owns the returned context and must
+// release it with llama_free after all dependent common_speculative instances
+// have been freed. Returns nullptr if the speculative params have no draft model.
+// topk / sample_temp / other per-ctx_dft config is applied here so the shared
+// context is fully configured before it is wired into any common_speculative.
+llama_context * common_speculative_create_ctx_dft(common_params_speculative & params);
+
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt);
+        llama_context             * ctx_tgt,
+        llama_context             * ctx_dft_shared = nullptr);
 
 void common_speculative_free(common_speculative * spec);
 
