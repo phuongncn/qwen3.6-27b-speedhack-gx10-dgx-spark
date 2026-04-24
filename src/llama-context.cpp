@@ -1206,7 +1206,7 @@ void llama_context::allocate_tape_gpu(int max_tokens) {
     dflash_capture->tape_gpu = std::move(tape);
 }
 
-void llama_context::tape_replay(int n_accepted) {
+void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     if (!dflash_capture || n_accepted <= 0) {
         return;
     }
@@ -1238,16 +1238,16 @@ void llama_context::tape_replay(int n_accepted) {
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
 
-    // find the cell index for seq 0
+    // find the tail cell for this seq_id
     int32_t cell_idx = -1;
-    if (mem_recurrent->size > 0) {
-        int32_t tail = mem_recurrent->cells[0].tail;
+    if (seq_id >= 0 && (uint32_t) seq_id < mem_recurrent->size) {
+        int32_t tail = mem_recurrent->cells[seq_id].tail;
         if (tail >= 0) {
             cell_idx = tail;
         }
     }
     if (cell_idx < 0) {
-        LLAMA_LOG_WARN("%s: no active cell for seq 0\n", __func__);
+        LLAMA_LOG_WARN("%s: no active cell for seq %d\n", __func__, seq_id);
         return;
     }
 
@@ -1489,13 +1489,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
         ggml_backend_tensor_set(r_tensor, new_conv.data(), r_offset, n_embd_r * sizeof(float));
     }
 
-    // advance the cell position to reflect n_accepted tokens processed
-    {
-        int32_t tail = mem_recurrent->cells[0].tail;
-        if (tail >= 0) {
-            mem_recurrent->cells[tail].pos += n_accepted;
-        }
-    }
+    mem_recurrent->cells[cell_idx].pos += n_accepted;
 }
 
 void llama_context::tape_replay_sync() {
@@ -1569,7 +1563,7 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
     }
 }
 
-void llama_context::dflash_rollback(llama_seq_id seq_backup, int n_past_before, int n_accepted) {
+void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
     auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     if (!mem_hybrid) {
         LLAMA_LOG_WARN("%s: dflash_rollback requires hybrid memory\n", __func__);
@@ -1582,26 +1576,26 @@ void llama_context::dflash_rollback(llama_seq_id seq_backup, int n_past_before, 
     if (tree_bufs.n_tokens > 0) {
         // Tree mode: branch tokens may have polluted KV at accepted positions.
         // Remove ALL entries from n_past_before onwards and restore from backup.
-        mem_attn->seq_rm(0, n_past_before, -1);
-        mem_attn->seq_cp(seq_backup, 0, n_past_before, -1);
+        mem_attn->seq_rm(seq_id, n_past_before, -1);
+        mem_attn->seq_cp(seq_backup, seq_id, n_past_before, -1);
         mem_attn->seq_rm(seq_backup, -1, -1);
     } else {
         // Flat mode: no duplicate entries at same position, safe to keep accepted KV
         int kv_keep_pos = n_past_before + n_accepted;
-        mem_attn->seq_rm(0, kv_keep_pos, -1);
+        mem_attn->seq_rm(seq_id, kv_keep_pos, -1);
         mem_attn->seq_rm(seq_backup, -1, -1);
     }
 
     // Recurrent state: restore from backup, then tape replay
-    mem_recr->seq_rm(0, -1, -1);
-    mem_recr->seq_cp(seq_backup, 0, -1, -1);
+    mem_recr->seq_rm(seq_id, -1, -1);
+    mem_recr->seq_cp(seq_backup, seq_id, -1, -1);
     mem_recr->seq_rm(seq_backup, -1, -1);
 
     // Replay DeltaNet state updates for accepted tokens
-    tape_replay(n_accepted);
+    tape_replay(seq_id, n_accepted);
 }
 
-void llama_context::dflash_prepare_branch(llama_seq_id seq_backup, int depth) {
+void llama_context::dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth) {
     auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     if (!mem_hybrid) {
         LLAMA_LOG_WARN("%s: dflash_prepare_branch requires hybrid memory\n", __func__);
@@ -1611,11 +1605,11 @@ void llama_context::dflash_prepare_branch(llama_seq_id seq_backup, int depth) {
     auto * mem_recr = mem_hybrid->get_mem_recr();
 
     // restore recurrent state from backup (keep backup intact for subsequent branches)
-    mem_recr->seq_rm(0, -1, -1);
-    mem_recr->seq_cp(seq_backup, 0, -1, -1);
+    mem_recr->seq_rm(seq_id, -1, -1);
+    mem_recr->seq_cp(seq_backup, seq_id, -1, -1);
 
     // tape replay to get DeltaNet state after processing 'depth' tokens (root + main_path[1..depth-1])
-    tape_replay(depth);
+    tape_replay(seq_id, depth);
 }
 
 // round up to next bucket: 16, 32, 64, 128, 256, 512, 1024, 2048, ...
@@ -4271,20 +4265,20 @@ void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
 }
 
-void llama_tape_replay(llama_context * ctx, int n_accepted) {
-    ctx->tape_replay(n_accepted);
+void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {
+    ctx->tape_replay(seq_id, n_accepted);
 }
 
 void llama_tape_replay_sync(llama_context * ctx) {
     ctx->tape_replay_sync();
 }
 
-void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
-    ctx->dflash_rollback(seq_backup, n_past_before, n_accepted);
+void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
+    ctx->dflash_rollback(seq_id, seq_backup, n_past_before, n_accepted);
 }
 
-void llama_dflash_prepare_branch(llama_context * ctx, llama_seq_id seq_backup, int depth) {
-    ctx->dflash_prepare_branch(seq_backup, depth);
+void llama_dflash_prepare_branch(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int depth) {
+    ctx->dflash_prepare_branch(seq_id, seq_backup, depth);
 }
 
 void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {

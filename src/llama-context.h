@@ -358,16 +358,16 @@ public:
     void allocate_tape_gpu(int max_tokens);
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
-    void tape_replay(int n_accepted);
+    void tape_replay(llama_seq_id seq_id, int n_accepted);
     void tape_replay_sync();
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
-    void dflash_rollback(llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
 
     // DFlash: prepare DeltaNet state for branch verification (recurrent restore + tape replay, no KV touch)
-    void dflash_prepare_branch(llama_seq_id seq_backup, int depth);
+    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
 
     // DFlash: set cross data for drafter context
     void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);

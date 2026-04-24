@@ -1070,7 +1070,7 @@ extern "C" {
     // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
     // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
     // Must be called after restoring from backup (seq_cp) and before the next decode
-    LLAMA_API void llama_tape_replay(struct llama_context * ctx, int n_accepted);
+    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int n_accepted);
 
     // DFlash: complete rollback for hybrid models after partial acceptance
     // For hybrid (attention+recurrent) models, handles KV cache and recurrent state separately:
@@ -1079,6 +1079,7 @@ extern "C" {
     // This replaces the manual seq_rm/seq_cp + tape_replay sequence
     LLAMA_API void llama_dflash_rollback(
             struct llama_context * ctx,
+            llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
             int                    n_past_before,
             int                    n_accepted);
@@ -1091,6 +1092,7 @@ extern "C" {
     // Does NOT touch attention KV cache or destroy the backup.
     LLAMA_API void llama_dflash_prepare_branch(
             struct llama_context * ctx,
+            llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
             int                    depth);
 

@@ -3015,7 +3015,7 @@ private:
                             llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
                         } else {
                             llama_clear_tree_parent_ids(ctx);
-                            llama_dflash_rollback(ctx, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
+                            llama_dflash_rollback(ctx, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
                         }
                     } else {
                         // Generic: backup-restore + re-decode for other speculative types
