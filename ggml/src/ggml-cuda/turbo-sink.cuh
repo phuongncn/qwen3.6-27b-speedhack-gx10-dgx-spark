@@ -1,5 +1,9 @@
 #pragma once
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_fp16.h>
+#endif
 #include <cstdint>
 
 // Attention-sink token protection: store rotated fp16 values for the first N

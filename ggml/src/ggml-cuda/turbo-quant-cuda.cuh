@@ -1,6 +1,12 @@
 #pragma once
+// Route vendor headers (cuda_runtime, cuda_fp16) through the shim for
+// CUDA/HIP portability — see ggml-cuda/vendors/{cuda,hip}.h.
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 #include "ggml-common.h"
 
 // === InnerQ per-channel equalization ===
@@ -758,11 +764,11 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     }
     if (sid < 32) {
         float v = cost[sid];
-        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
@@ -834,8 +840,8 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         int my_idx = sid;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            float other_cost = __shfl_xor_sync(0xFFFFFFFF, my_cost, offset);
-            int other_idx = __shfl_xor_sync(0xFFFFFFFF, my_idx, offset);
+            float other_cost = __shfl_xor_sync(0xFFFFFFFFULL, my_cost, offset);
+            int other_idx = __shfl_xor_sync(0xFFFFFFFFULL, my_idx, offset);
             if (other_cost < my_cost) { my_cost = other_cost; my_idx = other_idx; }
         }
         if (sid % 32 == 0) {
@@ -899,11 +905,11 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     }
     if (sid < 32) {
         float v = cost[sid];
-        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
@@ -1064,11 +1070,11 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     }
     if (sid < 32) {
         float v = cost[sid];
-        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
@@ -1138,8 +1144,8 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         int my_idx = sid;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            float other_cost = __shfl_xor_sync(0xFFFFFFFF, my_cost, offset);
-            int other_idx = __shfl_xor_sync(0xFFFFFFFF, my_idx, offset);
+            float other_cost = __shfl_xor_sync(0xFFFFFFFFULL, my_cost, offset);
+            int other_idx = __shfl_xor_sync(0xFFFFFFFFULL, my_idx, offset);
             if (other_cost < my_cost) { my_cost = other_cost; my_idx = other_idx; }
         }
         if (sid % 32 == 0) {
@@ -1204,11 +1210,11 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     }
     if (sid < 32) {
         float v = cost[sid];
-        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
-        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFFULL, v, 1);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
