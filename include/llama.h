@@ -1067,6 +1067,12 @@ extern "C" {
     // during verification decode for efficient state replay instead of full re-evaluation
     LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
 
+    // DFlash: select which slot's GPU tape the next llama_decode() writes into.
+    // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
+    // concurrent slots don't clobber each other. Must be called before each decode
+    // when multi-slot tape is in use. No-op for single-slot contexts.
+    LLAMA_API void llama_dflash_set_active_slot(struct llama_context * ctx, int slot_idx);
+
     // DFlash: replay tape data to reconstruct DeltaNet state after partial acceptance
     // Applies n_accepted tokens worth of state updates on CPU instead of full model re-eval
     // Must be called after restoring from backup (seq_cp) and before the next decode

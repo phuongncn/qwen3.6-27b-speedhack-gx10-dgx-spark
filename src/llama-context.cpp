@@ -1006,7 +1006,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
             // with GPU tape, only intercept qkv_mixed (others captured by graph)
-            if (cap->tape_gpu) {
+            if (cap->active_tape()) {
                 auto it = cap->tape_name_map.find(t->name);
                 return (it != cap->tape_name_map.end() && it->second.second == DFLASH_TAPE_QKV);
             }
@@ -1045,7 +1045,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
             // when GPU tape is active, k/v/gate/beta are captured by graph-embedded copies
             // only qkv_mixed still needs eval callback (for CPU-side conv state rebuild)
-            if (cap->tape_gpu && type != DFLASH_TAPE_QKV) {
+            if (cap->active_tape() && type != DFLASH_TAPE_QKV) {
                 return true; // skip — already on GPU
             }
 
@@ -1150,17 +1150,23 @@ void llama_context::set_tape_recording(bool enable) {
         }
         dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
 
-        // allocate GPU-resident tape buffer (graph writes directly, no eval callback sync)
-        allocate_tape_gpu(20); // max 20 tokens per verify batch (16 draft + a few extra)
+        // allocate GPU-resident tape buffer (graph writes directly, no eval callback sync).
+        // Default single-slot; callers that want multi-slot (e.g. llama-server with
+        // --dflash-max-slots > 1) call allocate_tape_gpu(n_slots, max_tokens) explicitly
+        // before set_tape_recording(true), and we pick up their allocation.
+        allocate_tape_gpu(1, 20); // max 20 tokens per verify batch (16 draft + a few extra)
     }
 
-    // expose to graph builder via cparams
-    cparams.tape_gpu = (enable && dflash_capture->tape_gpu) ? dflash_capture->tape_gpu.get() : nullptr;
+    // expose to graph builder via cparams (tracks the currently active slot)
+    cparams.tape_gpu = (enable && dflash_capture->active_tape()) ? dflash_capture->active_tape() : nullptr;
 }
 
-void llama_context::allocate_tape_gpu(int max_tokens) {
+void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture || dflash_capture->recurrent_layer_ids.empty()) {
         return;
+    }
+    if (n_slots < 1) {
+        n_slots = 1;
     }
 
     // find GPU backend
@@ -1190,40 +1196,70 @@ void llama_context::allocate_tape_gpu(int max_tokens) {
                        ? (int64_t) hparams.ssm_n_group   // 1 (not repeated)
                        : H_v;                             // 8 (repeated)
 
-    // allocate ggml context for tensor descriptors
-    size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
-    struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-    struct ggml_context * tape_ctx = ggml_init(ctx_params);
+    dflash_capture->tapes.clear();
+    dflash_capture->tapes.reserve(n_slots);
 
-    auto tape = std::make_unique<dflash_tape_gpu>();
-    tape->layers.resize(n_rec);
-    tape->layer_ids = dflash_capture->recurrent_layer_ids;
-    tape->max_tokens = max_tokens;
-    tape->ctx = tape_ctx;
+    size_t total_size = 0;
 
-    // create tensor descriptors
-    for (int li = 0; li < n_rec; ++li) {
-        auto & tl = tape->layers[li];
-        tl.k    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_k, (int64_t)max_tokens);
-        tl.v    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_v, (int64_t)max_tokens);
-        tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
-        tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+    for (int slot = 0; slot < n_slots; ++slot) {
+        // allocate ggml context for this slot's tensor descriptors
+        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        struct ggml_context * tape_ctx = ggml_init(ctx_params);
+
+        auto tape = std::make_unique<dflash_tape_gpu>();
+        tape->layers.resize(n_rec);
+        tape->layer_ids = dflash_capture->recurrent_layer_ids;
+        tape->max_tokens = max_tokens;
+        tape->ctx = tape_ctx;
+
+        for (int li = 0; li < n_rec; ++li) {
+            auto & tl = tape->layers[li];
+            tl.k    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_k, (int64_t)max_tokens);
+            tl.v    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_v, (int64_t)max_tokens);
+            tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+            tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+        }
+
+        tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
+
+        if (!tape->buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d, falling back to CPU tape\n",
+                __func__, slot);
+            ggml_free(tape_ctx);
+            dflash_capture->tapes.clear();
+            return;
+        }
+
+        total_size += ggml_backend_buffer_get_size(tape->buf);
+        dflash_capture->tapes.push_back(std::move(tape));
     }
 
-    // allocate a single GPU buffer for all tape tensors
-    tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
+    dflash_capture->active_tape_idx = 0;
 
-    if (!tape->buf) {
-        LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer, falling back to CPU tape\n", __func__);
-        ggml_free(tape_ctx);
+    LLAMA_LOG_INFO("%s: allocated GPU tape buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
+        __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_rec, max_tokens);
+}
+
+void llama_context::set_active_dflash_slot(int slot_idx) {
+    if (!dflash_capture || dflash_capture->tapes.empty()) {
         return;
     }
-
-    size_t buf_size = ggml_backend_buffer_get_size(tape->buf);
-    LLAMA_LOG_INFO("%s: allocated GPU tape buffer: %.1f MB (%d layers, %d max tokens)\n",
-        __func__, buf_size / (1024.0 * 1024.0), n_rec, max_tokens);
-
-    dflash_capture->tape_gpu = std::move(tape);
+    if (slot_idx < 0 || slot_idx >= (int) dflash_capture->tapes.size()) {
+        LLAMA_LOG_WARN("%s: slot %d out of range [0, %d) — ignoring\n",
+            __func__, slot_idx, (int) dflash_capture->tapes.size());
+        return;
+    }
+    if (slot_idx == dflash_capture->active_tape_idx) {
+        return;
+    }
+    dflash_capture->active_tape_idx = slot_idx;
+    cparams.tape_gpu = dflash_capture->active_tape();
+    // graph nodes hold references to the previous slot's tape tensors; invalidate
+    // so the next decode rebuilds with the new slot's tensors.
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
@@ -1235,8 +1271,9 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     tape_replay_sync();
 
     // GPU-resident tape path: data already on GPU from graph-embedded copies
-    const bool use_gpu_tape = (dflash_capture->tape_gpu != nullptr &&
-                               n_accepted <= dflash_capture->tape_gpu->max_tokens);
+    dflash_tape_gpu * const gpu_tape = dflash_capture->active_tape();
+    const bool use_gpu_tape = (gpu_tape != nullptr &&
+                               n_accepted <= gpu_tape->max_tokens);
 
     if (!use_gpu_tape && dflash_capture->tape_layers.empty()) {
         return;
@@ -1318,7 +1355,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             int64_t S, H_k, H_v;
             if (use_gpu_tape) {
-                auto & tl = dflash_capture->tape_gpu->layers[li];
+                auto & tl = gpu_tape->layers[li];
                 S   = tl.k->ne[0];
                 H_k = tl.k->ne[1];
                 H_v = tl.v->ne[1];
@@ -1334,7 +1371,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             if (use_gpu_tape) {
                 // create views into pre-filled GPU tape tensors (zero upload)
-                auto & tl = dflash_capture->tape_gpu->layers[li];
+                auto & tl = gpu_tape->layers[li];
                 k_in = ggml_view_4d(ctx, tl.k, S, H_k, (int64_t)n_accepted, (int64_t)1,
                     tl.k->nb[1], tl.k->nb[2], tl.k->nb[2] * n_accepted, 0);
                 v_in = ggml_view_4d(ctx, tl.v, S, H_v, (int64_t)n_accepted, (int64_t)1,
@@ -4288,6 +4325,10 @@ void llama_set_dflash_topk(llama_context * ctx, int k) {
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
+}
+
+void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {
+    ctx->set_active_dflash_slot(slot_idx);
 }
 
 void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {

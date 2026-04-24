@@ -106,8 +106,18 @@ struct dflash_capture_data {
     std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
     std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
 
-    // GPU-resident tape: graph writes directly to these tensors (no eval callback sync)
-    std::unique_ptr<dflash_tape_gpu> tape_gpu;
+    // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
+    // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
+    // (default), `tapes` has size 1 and `active_tape_idx` is always 0 — behavior is
+    // byte-identical to the pre-multi-slot singleton.
+    std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
+    int active_tape_idx = 0;
+
+    dflash_tape_gpu * active_tape() const {
+        return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
+                   ? tapes[active_tape_idx].get()
+                   : nullptr;
+    }
 
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
     ggml_backend_buffer_t replay_buf = nullptr;
@@ -358,8 +368,17 @@ public:
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
 
-    // DFlash: allocate GPU-resident tape buffer for graph-embedded recording
-    void allocate_tape_gpu(int max_tokens);
+    // DFlash: allocate GPU-resident tape buffer for graph-embedded recording.
+    // n_slots > 1 allocates per-slot buffers so concurrent slots (llama-server -np > 1)
+    // don't clobber each other's tape entries. The single-arg overload keeps legacy
+    // callers single-slot.
+    void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
+    void allocate_tape_gpu(int n_slots, int max_tokens);
+
+    // DFlash: select which slot's tape the next llama_decode() writes into.
+    // Must be called before each decode when multi-slot tape is in use.
+    // No-op when n_slots == 1. Invalidates graph reuse if the slot changes.
+    void set_active_dflash_slot(int slot_idx);
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
     void tape_replay(llama_seq_id seq_id, int n_accepted);
