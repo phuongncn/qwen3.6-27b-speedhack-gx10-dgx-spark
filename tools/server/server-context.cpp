@@ -2576,6 +2576,15 @@ private:
                             (llama_model_n_swa(model) > 0 && !params_base.swa_full)
                             );
 
+                    // DFlash: the prefill-split for checkpoint placement (line below) drops the
+                    // first N-4 prefill hidden states from the DFlash ring buffer, because each
+                    // llama_decode overwrites the capture buffer and common_speculative_begin()
+                    // only reads it once (after the final sub-batch). Disable checkpointing for
+                    // DFlash: we don't need server checkpoints (DFlash has its own tape-replay
+                    // rollback for speculation), and skipping the split lets the drafter see the
+                    // full prompt hidden state context on its first draft call. ~12pp accept gain.
+                    do_checkpoint = do_checkpoint && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH;
+
                     bool has_mtmd = false;
 
                     // check if we should process the image
@@ -2937,8 +2946,15 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // update DFlash hidden state ring buffer with the decoded token's hidden states
-                if (slot.can_speculate()) {
+                // update DFlash hidden state ring buffer with the decoded token's hidden states.
+                // Skip on the first sample after prompt: common_speculative_begin() above already
+                // populated the ring with all prefill hiddens. The capture buffer at this point
+                // still holds prefill hiddens (no new decode happened), so ring_write(1) here would
+                // append a stale duplicate at the position that should later hold `id`'s hidden —
+                // silently corrupting the drafter's cross-attention context on every subsequent
+                // verify. Fires correctly on the fallback non-spec path during generation
+                // (draft too small → single-token decode), where slot.sampled was just decoded.
+                if (slot.can_speculate() && slot.n_decoded > 0) {
                     llama_tokens batch_tokens = { id };
                     common_speculative_update_logits(slot.spec, ctx, batch_tokens, 1);
                 }
