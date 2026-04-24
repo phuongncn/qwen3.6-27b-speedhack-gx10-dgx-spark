@@ -98,7 +98,8 @@ struct dflash_capture_data {
     std::vector<int32_t> layer_ids;           // layer indices to capture
     std::vector<std::string> tensor_names;    // pre-formatted "l_out-{id}" names
     std::unordered_map<std::string, size_t> hidden_name_idx; // name → index for O(1) lookup
-    std::vector<dflash_layer_hidden_buf> * hiddens;  // pointer to context's layer_hiddens
+    // pointer to context's layer_hiddens (outer: per-slot, inner: per-captured-layer)
+    std::vector<std::vector<dflash_layer_hidden_buf>> * hiddens;
 
     // tape recording (for DeltaNet state rollback)
     bool tape_enabled = false;
@@ -117,6 +118,13 @@ struct dflash_capture_data {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
                    : nullptr;
+    }
+
+    std::vector<dflash_layer_hidden_buf> * active_slot_hiddens() const {
+        if (!hiddens || active_tape_idx < 0 || active_tape_idx >= (int) hiddens->size()) {
+            return nullptr;
+        }
+        return &(*hiddens)[active_tape_idx];
     }
 
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
@@ -351,9 +359,9 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
     // DFlash hidden state accessors
-    float * get_layer_hidden(int slot);
-    int64_t get_layer_hidden_n_tokens(int slot) const;
-    int64_t get_layer_hidden_n_embd(int slot) const;
+    float * get_layer_hidden(int layer_idx);
+    int64_t get_layer_hidden_n_tokens(int layer_idx) const;
+    int64_t get_layer_hidden_n_embd(int layer_idx) const;
     int32_t get_n_layer_hiddens() const;
 
     // DFlash: configure hidden state capture layers
@@ -477,8 +485,9 @@ private:
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
-    // DFlash: captured hidden states from target model layers
-    std::vector<dflash_layer_hidden_buf> layer_hiddens;
+    // DFlash: captured hidden states (outer: per-slot matching dflash_capture->tapes,
+    // inner: per-captured-layer). Single-slot default is 1 × n_capture_layers.
+    std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
 
     std::unique_ptr<dflash_capture_data> dflash_capture;
 

@@ -903,29 +903,35 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
-float * llama_context::get_layer_hidden(int slot) {
-    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+// Readers return data from the active DFlash slot; multi-slot callers must
+// call llama_dflash_set_active_slot() before reading.
+float * llama_context::get_layer_hidden(int layer_idx) {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
         return nullptr;
     }
-    return layer_hiddens[slot].data.data();
+    return (*sh)[layer_idx].data.data();
 }
 
-int64_t llama_context::get_layer_hidden_n_tokens(int slot) const {
-    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+int64_t llama_context::get_layer_hidden_n_tokens(int layer_idx) const {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
         return 0;
     }
-    return layer_hiddens[slot].n_tokens;
+    return (*sh)[layer_idx].n_tokens;
 }
 
-int64_t llama_context::get_layer_hidden_n_embd(int slot) const {
-    if (slot < 0 || slot >= (int) layer_hiddens.size()) {
+int64_t llama_context::get_layer_hidden_n_embd(int layer_idx) const {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
         return 0;
     }
-    return layer_hiddens[slot].n_embd;
+    return (*sh)[layer_idx].n_embd;
 }
 
 int32_t llama_context::get_n_layer_hiddens() const {
-    return (int32_t) layer_hiddens.size();
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    return sh ? (int32_t) sh->size() : 0;
 }
 
 // helper: read tensor data into a raw float pointer, handling non-contiguous views
@@ -1022,7 +1028,9 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
     // buf.n_tokens before the ubatch loop, so within one llama_decode() call
     // the buffer accumulates all ubatches.
     if (h_it != cap->hidden_name_idx.end()) {
-        auto & buf = (*cap->hiddens)[h_it->second];
+        auto * slot_hiddens = cap->active_slot_hiddens();
+        GGML_ASSERT(slot_hiddens && h_it->second < slot_hiddens->size());
+        auto & buf = (*slot_hiddens)[h_it->second];
         const int64_t new_embd = t->ne[0];
         const int64_t new_n    = t->ne[1];
 
@@ -1102,7 +1110,7 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     // set up eval callback for zero-graph-modification capture
     dflash_capture = std::make_unique<dflash_capture_data>();
     dflash_capture->hiddens = &layer_hiddens;
-    layer_hiddens.resize(n_layers);
+    layer_hiddens.assign(1, std::vector<dflash_layer_hidden_buf>(n_layers));
 
     for (int32_t i = 0; i < n_layers; ++i) {
         dflash_capture->layer_ids.push_back(layer_ids[i]);
@@ -1120,7 +1128,11 @@ void llama_context::dflash_reset_hidden_capture() {
     if (!dflash_capture) {
         return;
     }
-    for (auto & buf : layer_hiddens) {
+    auto * sh = dflash_capture->active_slot_hiddens();
+    if (!sh) {
+        return;
+    }
+    for (auto & buf : *sh) {
         buf.n_tokens = 0;
     }
 }
@@ -1167,6 +1179,17 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     }
     if (n_slots < 1) {
         n_slots = 1;
+    }
+
+    // keep layer_hiddens outer dim in sync with the tape slot count
+    if (!layer_hiddens.empty() && (int) layer_hiddens.size() != n_slots) {
+        const size_t n_capture_layers = layer_hiddens.front().size();
+        layer_hiddens.resize(n_slots);
+        for (auto & slot_bufs : layer_hiddens) {
+            if (slot_bufs.size() != n_capture_layers) {
+                slot_bufs.resize(n_capture_layers);
+            }
+        }
     }
 
     // find GPU backend
