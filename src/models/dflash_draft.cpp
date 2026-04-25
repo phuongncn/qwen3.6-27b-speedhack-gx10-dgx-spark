@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include <algorithm>
 #include <atomic>
 
 // DFlash drafter custom graph input
