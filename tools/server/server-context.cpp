@@ -2187,6 +2187,13 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // --- profiling: per-cycle timing breakdown ---
+        const int64_t t_cycle_start = ggml_time_us();
+        int64_t t_draft_total = 0;
+        int64_t t_verify_total = 0;
+        int64_t t_accept_total = 0;
+        int n_slots_drafted = 0;
+
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
         // B1-style dynamic bucketing (~128-256 ctx_len) instead of the fixed
@@ -2221,6 +2228,7 @@ private:
             //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
+                const int64_t t_draft_slot_start = ggml_time_us();
                 if (mctx) {
                     // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                     GGML_ABORT("not supported by multimodal");
@@ -2282,6 +2290,8 @@ private:
                     }
                     slot.drafted = std::move(draft);
                 }
+                t_draft_total += ggml_time_us() - t_draft_slot_start;
+                n_slots_drafted++;
             } else {
                 // no speculative decoding
                 slot.i_batch = batch.n_tokens;
@@ -2298,6 +2308,10 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
+
+        // B2.6: track how many TG tokens are in the batch vs total, to detect
+        // pure-verify batches where multi-seq batching is safe.
+        const int32_t n_tg_tokens = batch.n_tokens;
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
@@ -2881,6 +2895,15 @@ private:
 
         int32_t i_next = 0;
 
+        // B2.6: allow multi-seq batching when the batch is pure TG (no prompt
+        // tokens). This lets concurrent slots' verify tokens be processed in a
+        // single multi-seq ubatch instead of N sequential per-seq ubatches.
+        const bool can_batch_multiseq = (n_tg_tokens == batch.n_tokens && n_tg_tokens > 0
+            && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+        if (can_batch_multiseq) {
+            llama_set_force_split_seq(ctx, false);
+        }
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -2895,7 +2918,12 @@ private:
                 batch.logits   + i,
             };
 
+            const int64_t t_verify_start = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
+            const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
+            t_verify_total += t_verify_elapsed;
+            SRV_INF("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
+                    n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, n_tokens));
 
             metrics.on_decoded(slots);
 
@@ -3082,6 +3110,7 @@ private:
             }
 
             // speculative decoding - main model sample and accept
+            const int64_t t_accept_start = ggml_time_us();
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || slot.i_batch_dft.empty()) {
                     continue;
@@ -3197,6 +3226,17 @@ private:
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
+            t_accept_total += ggml_time_us() - t_accept_start;
+        }
+
+        // --- profiling: log per-cycle breakdown ---
+        if (n_slots_drafted > 0) {
+            const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
+            const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
+            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+                    n_slots_drafted,
+                    t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
+                    t_other / 1e3, t_cycle_total / 1e3);
         }
 
         // turn off DFlash tape recording after all sub-batches — was turned on
@@ -3206,6 +3246,11 @@ private:
         // verify batch spans more than one ubatch.
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx, false);
+        }
+
+        // B2.6: restore force_split_seq for the next cycle (prompt batches need it)
+        if (can_batch_multiseq) {
+            llama_set_force_split_seq(ctx, true);
         }
 
         SRV_DBG("%s", "run slots completed\n");

@@ -1080,6 +1080,12 @@ extern "C" {
     // during verification decode for efficient state replay instead of full re-evaluation
     LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
 
+    // B2.6: toggle force_split_seq on the memory. When false, the batch allocator
+    // may produce multi-seq ubatches (split_equal), allowing concurrent verify tokens
+    // from multiple slots to be processed in a single GPU launch. Set to false before
+    // a verify-only decode, and true after (mixed prompt+TG batches need split_seq).
+    LLAMA_API void llama_set_force_split_seq(struct llama_context * ctx, bool force);
+
     // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
     // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
     // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.

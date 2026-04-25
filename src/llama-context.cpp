@@ -1199,10 +1199,14 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     cparams.cb_eval = dflash_eval_callback;
     cparams.cb_eval_user_data = dflash_capture.get();
 
-    // B2.6: force_split_seq no longer needed — GPU tape graph ops, eval
-    // callback hidden scatter, and QKV per-seq metadata all support
-    // multi-seq ubatches. split_equal batching reduces verify latency
-    // for concurrent slots.
+    // B2.6: GPU tape, eval callback hidden scatter, and QKV per-seq
+    // metadata all support multi-seq ubatches. However, the server's
+    // batch can mix prompt + TG tokens from different slots; split_equal
+    // on such mixed batches produces incorrect ubatches. Expose the flag
+    // so callers can toggle it off for verify-only decodes.
+    if (memory) {
+        memory->set_force_split_seq(true);
+    }
 }
 
 void llama_context::dflash_reset_hidden_capture() {
@@ -4550,6 +4554,13 @@ void llama_set_dflash_n_slots(llama_context * ctx, int n) {
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
     ctx->set_tape_recording(enable);
+}
+
+void llama_set_force_split_seq(llama_context * ctx, bool force) {
+    auto * mem = llama_get_memory(ctx);
+    if (mem) {
+        mem->set_force_split_seq(force);
+    }
 }
 
 void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {
