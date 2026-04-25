@@ -1624,6 +1624,11 @@ private:
 
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
+        // [CHECKPOINT B2.3] route reads to this slot's hidden buffers. After concurrent
+        // multi-slot target decode, active_tape_idx reflects the LAST decoded slot's
+        // index. Each slot's update_logits/capture must select its own buffer first.
+        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         if (n_slots == 0) {
             return;
@@ -1667,6 +1672,10 @@ private:
 
     // called after each verification decode — append only the accepted tokens' hidden states
     void append_target_hiddens(int n_accepted) {
+        // [CHECKPOINT B2.3] select this slot's hidden buffers before reading. See
+        // capture_target_hiddens() for the rationale.
+        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         if (n_slots == 0 || n_accepted <= 0) {
             return;
