@@ -114,20 +114,12 @@ struct dflash_capture_data {
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     int active_tape_idx = 0;
 
-    // Per-ubatch routing metadata, written by the decode loop before each
-    // process_ubatch() call. Used by the eval callback to scatter hidden-state
-    // captures into per-slot layer_hiddens buffers when one ubatch carries
-    // tokens for multiple slots (concurrent multi-slot DFlash).
-    //
-    // ubatch_active_slot:
-    //   >= 0  single-seq ubatch with a valid DFlash slot — fast path writes
-    //         the whole ubatch's tensor directly to layer_hiddens[slot].
-    //   -1    multi-seq ubatch (scatter per-token via ubatch_seq_id), or
-    //         single-seq ubatch whose seq has no DFlash slot (skip capture).
-    int                          ubatch_active_slot = -1;
-    const llama_seq_id * const * ubatch_seq_id      = nullptr; // [n_tokens] -> seq id list
-    uint32_t                     ubatch_n_tokens    = 0;
-    uint32_t                     ubatch_n_seqs_unq  = 0;
+    // Active ubatch for the in-flight process_ubatch() call. The eval callback
+    // reads ubatch->n_seqs_unq / ubatch->seq_id to route hidden-state captures
+    // to layer_hiddens[seq] (per-token scatter under multi-seq ubatches).
+    // ggml's scheduler serializes callbacks within a graph compute, so this
+    // pointer is safe to read without synchronization.
+    const llama_ubatch * ubatch = nullptr;
 
     // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
     std::vector<float> scatter_buf;
@@ -138,18 +130,15 @@ struct dflash_capture_data {
                    : nullptr;
     }
 
-    std::vector<dflash_layer_hidden_buf> * active_slot_hiddens() const {
-        if (!hiddens || active_tape_idx < 0 || active_tape_idx >= (int) hiddens->size()) {
-            return nullptr;
-        }
-        return &(*hiddens)[active_tape_idx];
-    }
-
     std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
         if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
             return nullptr;
         }
         return &(*hiddens)[slot];
+    }
+
+    std::vector<dflash_layer_hidden_buf> * active_slot_hiddens() const {
+        return slot_hiddens(active_tape_idx);
     }
 
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
