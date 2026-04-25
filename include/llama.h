@@ -1068,7 +1068,13 @@ extern "C" {
     LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool enable);
 
     // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
-    enum { LLAMA_DFLASH_MAX_VERIFY_TOKENS = 20 };
+    // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
+    // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.
+    enum {
+        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 20,
+        LLAMA_DFLASH_MAX_SLOTS         = 8,
+        LLAMA_DFLASH_PER_SLOT_CTX      = 512,
+    };
 
     // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
     // Call before the first llama_decode() (and before set_tape_recording(true)). For
