@@ -736,9 +736,15 @@ private:
             // (batched multi-slot draft). Size drafter ubatch exactly for that so
             // graph reservation matches the worst case and users who opt into a
             // larger target -ub don't inflate the drafter.
+            // Also: the shared drafter context routes per-slot work via seq_id, so
+            // n_seq_max must cover the DFlash slot cap (n_seq_max comes from
+            // params_dft.n_parallel via common_context_params_to_llama).
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
+                const int dflash_cap = std::max(1,
+                    std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
+                params_dft.n_parallel = dflash_cap;
             }
 
             params_base.speculative.model_dft = model_dft.get();
