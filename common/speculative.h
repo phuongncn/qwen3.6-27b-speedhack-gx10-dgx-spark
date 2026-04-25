@@ -66,6 +66,18 @@ llama_tokens common_speculative_draft(
                             llama_token   id_last,
                      std::vector<float> * draft_log_probs = nullptr);
 
+// [CHECKPOINT B2.4] Batched DFlash draft: all specs prepare cross data, one
+// combined multi-seq decode, results distributed back. Each spec must have
+// had set_seq_id called and share the same ctx_dft. Specs without a ready
+// DFlash impl get empty results. Does not run extension impls (CopySpec etc.)
+// — caller should extend per-spec results afterwards if desired.
+void common_speculative_draft_batch(
+        std::vector<common_speculative *> & specs,
+        llama_context                     * ctx_dft,
+        const common_params_speculative   & params,
+        const std::vector<llama_token>    & id_last_per_spec,
+        std::vector<llama_tokens>         & result_per_spec);
+
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 

@@ -2200,6 +2200,11 @@ private:
         // n_slots×512 width — recovering single-slot throughput on np>1 servers.
         // The idempotent set_dflash_n_slots call costs nothing when unchanged
         // and triggers one sched_need_reserve per transition.
+        //
+        // [CHECKPOINT B2.5] When ≥2 DFlash slots need drafts, batch them into a
+        // single drafter decode. Results are stored in batched_drafts[] and consumed
+        // by the per-slot loop below.
+        std::vector<llama_tokens> batched_drafts(slots.size());
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (const auto & slot : slots) {
@@ -2208,6 +2213,31 @@ private:
                 }
             }
             llama_set_dflash_n_slots(ctx_dft_shared.get(), std::max(1, n_drafting));
+
+            if (n_drafting >= 2 && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                std::vector<common_speculative *> batch_specs;
+                std::vector<llama_token>          batch_id_lasts;
+                std::vector<int>                  batch_slot_ids;
+
+                for (auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+                        batch_specs.push_back(slot.spec);
+                        batch_id_lasts.push_back(slot.sampled);
+                        batch_slot_ids.push_back(slot.id);
+                    }
+                }
+
+                std::vector<llama_tokens> batch_results;
+                const int64_t t_batch_start = ggml_time_us();
+                common_speculative_draft_batch(
+                        batch_specs, ctx_dft_shared.get(),
+                        params_base.speculative, batch_id_lasts, batch_results);
+                t_draft_total = ggml_time_us() - t_batch_start;
+
+                for (size_t i = 0; i < batch_slot_ids.size(); i++) {
+                    batched_drafts[batch_slot_ids[i]] = std::move(batch_results[i]);
+                }
+            }
         }
 
         // first, add sampled tokens from any ongoing sequences
@@ -2224,8 +2254,6 @@ private:
             }
 
             // generate draft tokens in speculative decoding mode
-            // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
-            //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
@@ -2234,11 +2262,15 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-
-                const auto & params_spec = slot.task->params.speculative;
-
-                llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                // B2.5: use pre-computed batched draft if available, else single-slot
+                llama_tokens draft;
+                if (!batched_drafts[slot.id].empty()) {
+                    draft = std::move(batched_drafts[slot.id]);
+                } else {
+                    const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+                    const auto & params_spec = slot.task->params.speculative;
+                    draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
+                }
 
                 if (draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);

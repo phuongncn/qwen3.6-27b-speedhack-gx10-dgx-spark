@@ -210,6 +210,11 @@ struct common_speculative_state {
     // and the shared ctx_dft) this state owns. Default is 0 — legacy single-slot value.
     // Non-DFlash impls ignore this.
     virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
+
+    // [CHECKPOINT B2.4] Prepare cross-attention data for batched drafting on a shared
+    // ctx_dft. Builds ring→cross_buf→set_cross_data_seq. Returns cross_len (position
+    // offset for batch tokens), or -1 if not ready (no committed tokens).
+    virtual int prepare_batch_draft(llama_context * /*ctx_dft*/) { return -1; }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -1297,6 +1302,32 @@ struct common_speculative_state_dflash : public common_speculative_state {
         seq_id = seq_id_;
     }
 
+    // [CHECKPOINT B2.4] prepare cross-attention data for batched draft decode.
+    // Builds ring→cross_buf→set_cross_data_seq on ctx_dft. Returns cross_len
+    // (the position offset for tokens in the combined batch), or -1 if this
+    // slot has no committed tokens yet.
+    int prepare_batch_draft(llama_context * ctx_dft_ext) override {
+        if (committed_len == 0) {
+            return -1;
+        }
+
+        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
+        cross_buf.resize((size_t)n_target_features * cross_len);
+
+        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
+        for (int t = 0; t < cross_len; ++t) {
+            int slot = (read_start + t) % RING_SIZE;
+            for (int layer = 0; layer < n_target_layers; ++layer) {
+                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                       ring_buf[layer].data() + (size_t)slot * n_embd,
+                       n_embd * sizeof(float));
+            }
+        }
+
+        llama_set_cross_data_seq(ctx_dft_ext, seq_id, cross_buf.data(), n_target_features, cross_len);
+        return cross_len;
+    }
+
     // called after initial prefill — extract hidden states from target
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
@@ -2116,6 +2147,132 @@ llama_tokens common_speculative_draft(
     }
 
     return result;
+}
+
+// [CHECKPOINT B2.4] Batched DFlash draft: prepare cross data for all specs,
+// build one combined multi-seq batch, decode once, distribute results.
+void common_speculative_draft_batch(
+        std::vector<common_speculative *> & specs,
+        llama_context                     * ctx_dft,
+        const common_params_speculative   & params,
+        const std::vector<llama_token>    & id_last_per_spec,
+        std::vector<llama_tokens>         & result_per_spec) {
+    const int n_specs = (int) specs.size();
+    result_per_spec.clear();
+    result_per_spec.resize(n_specs);
+
+    if (n_specs == 0 || !ctx_dft) {
+        return;
+    }
+
+    const llama_model * model_dft  = llama_get_model(ctx_dft);
+    const int block_size           = llama_model_dflash_block_size(model_dft);
+    const int n_draft              = std::min(block_size - 1, params.n_max);
+    const int batch_len            = n_draft + 1;
+    const llama_token mask_tok     = (llama_token) llama_model_dflash_mask_token_id(model_dft);
+
+    const int64_t t0 = ggml_time_us();
+
+    // Phase 1: prepare cross-attention data per spec
+    struct ready_slot {
+        common_speculative_state * impl;
+        int           cross_len;
+        llama_seq_id  seq_id;
+        int           spec_idx;
+    };
+    std::vector<ready_slot> ready;
+    ready.reserve(n_specs);
+
+    for (int s = 0; s < n_specs; s++) {
+        for (auto & impl : specs[s]->impls) {
+            if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                continue;
+            }
+
+            const int cross_len = impl->prepare_batch_draft(ctx_dft);
+            if (cross_len < 0) {
+                break;
+            }
+
+            auto * dfl = static_cast<common_speculative_state_dflash *>(impl.get());
+            ready.push_back({ impl.get(), cross_len, dfl->seq_id, s });
+            break;
+        }
+    }
+
+    if (ready.empty()) {
+        return;
+    }
+
+    const int n_ready = (int) ready.size();
+
+    // Phase 2: set drafter graph width
+    llama_set_dflash_n_slots(ctx_dft, n_ready);
+
+    const int64_t t1 = ggml_time_us();
+
+    // Phase 3: build combined batch — each spec's tokens tagged with its seq_id
+    llama_batch batch = llama_batch_init(n_ready * batch_len, 0, 1);
+
+    for (const auto & rs : ready) {
+        common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.cross_len, { rs.seq_id }, true);
+        for (int i = 1; i < batch_len; i++) {
+            common_batch_add(batch, mask_tok, rs.cross_len + i, { rs.seq_id }, true);
+        }
+    }
+
+    // Phase 4: single decode for all specs
+    const int ret = llama_decode(ctx_dft, batch);
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        LOG_ERR("dflash batch: decode failed with %d\n", ret);
+        return;
+    }
+
+    const int64_t t2 = ggml_time_us();
+
+    // Phase 5: read per-spec argmax results
+    int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
+    float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+    const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
+
+    for (int r = 0; r < n_ready; r++) {
+        auto & rs     = ready[r];
+        auto & result = result_per_spec[rs.spec_idx];
+        const int offset = r * batch_len;
+
+        if (argmax) {
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+                result.push_back((llama_token) argmax[(offset + i) * K_flat]);
+            }
+        } else {
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+                float * logits = llama_get_logits_ith(ctx_dft, offset + i);
+                if (!logits) {
+                    break;
+                }
+                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                result.push_back(best);
+            }
+        }
+
+        // update stats
+        rs.impl->n_call_draft++;
+        if (!result.empty()) {
+            rs.impl->n_gen_drafts++;
+            rs.impl->n_gen_tokens += result.size();
+            specs[rs.spec_idx]->curr_impl = rs.impl;
+        }
+    }
+
+    const int64_t t3 = ggml_time_us();
+
+    LOG_INF("dflash batch draft (%d specs): prepare=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+            n_ready, (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t3 - t0) / 1e3);
+
+    GGML_UNUSED(argmax_probs);
 }
 
 common_speculative_tree common_speculative_draft_tree(

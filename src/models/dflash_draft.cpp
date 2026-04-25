@@ -27,101 +27,194 @@ public:
 };
 
 void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
-    // [CHECKPOINT B2.3] resolve cross data for the active seq.
-    // Multi-slot DFlash routes per-slot data through cross->v_embd_per_seq[seq] so
-    // concurrent slots don't clobber each other through the singleton cross->v_embd.
-    // When the active seq has a per-seq entry, read that. Otherwise fall through to
-    // the legacy v_embd buffer (encoder-decoder paths, single-slot pre-B1.x).
-    const float * src_data  = nullptr;
-    int64_t       src_n_enc  = 0;
-    int64_t       src_n_real = 0;
-    if (cross) {
-        llama_seq_id active_seq = -1;
-        if (ubatch && ubatch->n_seqs_unq > 0 && ubatch->seq_id_unq) {
-            active_seq = ubatch->seq_id_unq[0];
+    const int n_seqs = (ubatch && ubatch->n_seqs_unq > 1) ? (int) ubatch->n_seqs_unq : 1;
+
+    if (n_seqs == 1) {
+        // === Single-slot path ===
+        // [CHECKPOINT B2.3] resolve cross data for the active seq.
+        const float * src_data  = nullptr;
+        int64_t       src_n_enc  = 0;
+        int64_t       src_n_real = 0;
+        if (cross) {
+            llama_seq_id active_seq = -1;
+            if (ubatch && ubatch->n_seqs_unq > 0 && ubatch->seq_id_unq) {
+                active_seq = ubatch->seq_id_unq[0];
+            }
+            if (active_seq >= 0) {
+                auto it = cross->v_embd_per_seq.find(active_seq);
+                if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
+                    src_data   = it->second.v_embd.data();
+                    src_n_enc  = it->second.n_enc;
+                    src_n_real = it->second.n_enc_real;
+                }
+            }
+            if (!src_data && !cross->v_embd.empty()) {
+                src_data   = cross->v_embd.data();
+                src_n_enc  = cross->n_enc;
+                src_n_real = cross->n_enc_real;
+            }
         }
-        if (active_seq >= 0) {
-            auto it = cross->v_embd_per_seq.find(active_seq);
+
+        if (target_hidden && src_data && src_n_enc > 0) {
+            const size_t src_bytes    = (size_t) cross->n_embd * (size_t) src_n_enc * sizeof(float);
+            const size_t tensor_bytes = ggml_nbytes(target_hidden);
+            const size_t copy_bytes   = std::min(src_bytes, tensor_bytes);
+            ggml_backend_tensor_set(target_hidden, src_data, 0, copy_bytes);
+            if (copy_bytes < tensor_bytes) {
+                ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
+            }
+        }
+
+        const int64_t n_real = src_n_real > 0 ? src_n_real : ctx_len;
+
+        if (pos_ctx && pos_ctx->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
+            int32_t * data = (int32_t *) pos_ctx->data;
+            for (int64_t i = 0; i < ctx_len; ++i) {
+                data[i] = (i < n_real) ? (int32_t) i : 0;
+            }
+        }
+
+        if (kq_mask && kq_mask->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+            float * data = (float *) kq_mask->data;
+            const int64_t n_kv = ctx_len + n_block;
+            for (int64_t q = 0; q < n_block; ++q) {
+                for (int64_t k = 0; k < n_kv; ++k) {
+                    if (k >= n_real && k < ctx_len) {
+                        data[q * n_kv + k] = -INFINITY;
+                    } else {
+                        data[q * n_kv + k] = 0.0f;
+                    }
+                }
+            }
+        }
+
+        if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
+            float * data = (float *) kq_mask_swa->data;
+            const int64_t n_kv   = ctx_len + n_block;
+            const int32_t window = (int32_t) n_swa;
+            const bool    have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
+                                   && ((int64_t) ubatch->n_tokens >= n_block);
+            for (int64_t q = 0; q < n_block; ++q) {
+                const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t) (n_real + q);
+                for (int64_t k = 0; k < n_kv; ++k) {
+                    float v = 0.0f;
+                    if (k < n_real) {
+                        if (q_pos - (int32_t) k > window) v = -INFINITY;
+                    } else if (k < ctx_len) {
+                        v = -INFINITY;
+                    } else {
+                        const int64_t b_k = k - ctx_len;
+                        if (b_k > q) v = -INFINITY;
+                    }
+                    data[q * n_kv + k] = v;
+                }
+            }
+        }
+    } else {
+        // === [CHECKPOINT B2.4] Multi-slot batched draft path ===
+        // Pack each slot's cross data at per-slot offsets in target_hidden.
+        // Build per-slot isolating masks so each slot's block queries only
+        // attend to that slot's cross keys and block keys.
+        GGML_ASSERT(ctx_len % n_seqs == 0);
+        GGML_ASSERT(n_block % n_seqs == 0);
+        const int per_slot_ctx    = (int)(ctx_len / n_seqs);
+        const int n_seq_tokens    = (int)(n_block / n_seqs);
+        const size_t n_feat       = cross ? (size_t) cross->n_embd : 0;
+
+        // collect per-slot cross data
+        struct { const float * data; int64_t n_real; } slot_info[LLAMA_DFLASH_MAX_SLOTS] = {};
+        for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
+            llama_seq_id seq = ubatch->seq_id_unq[s];
+            if (!cross) { continue; }
+            auto it = cross->v_embd_per_seq.find(seq);
             if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
-                src_data   = it->second.v_embd.data();
-                src_n_enc  = it->second.n_enc;
-                src_n_real = it->second.n_enc_real;
+                slot_info[s] = { it->second.v_embd.data(), it->second.n_enc_real };
             }
         }
-        if (!src_data && !cross->v_embd.empty()) {
-            src_data   = cross->v_embd.data();
-            src_n_enc  = cross->n_enc;
-            src_n_real = cross->n_enc_real;
+
+        // pack target_hidden: slot s at offset [s * per_slot_ctx, (s+1) * per_slot_ctx)
+        if (target_hidden && n_feat > 0) {
+            ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
+            for (int s = 0; s < n_seqs; s++) {
+                if (!slot_info[s].data || slot_info[s].n_real <= 0) { continue; }
+                const size_t src_bytes  = n_feat * (size_t) slot_info[s].n_real * sizeof(float);
+                const size_t dst_offset = (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
+                ggml_backend_tensor_set(target_hidden, slot_info[s].data, dst_offset, src_bytes);
+            }
         }
-    }
 
-    // Copy target hidden states into the input tensor at offset 0 (active slot region).
-    // Source may be narrower than target_hidden when n_slots > 1 (other slot regions are
-    // padded). Zero-fill the rest — padding is masked to -INF in kq_mask so values are
-    // irrelevant.
-    if (target_hidden && src_data && src_n_enc > 0) {
-        const size_t src_bytes    = (size_t) cross->n_embd * (size_t) src_n_enc * sizeof(float);
-        const size_t tensor_bytes = ggml_nbytes(target_hidden);
-        const size_t copy_bytes   = std::min(src_bytes, tensor_bytes);
-        ggml_backend_tensor_set(target_hidden, src_data, 0, copy_bytes);
-        if (copy_bytes < tensor_bytes) {
-            ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
-        }
-    }
-
-    const int64_t n_real = src_n_real > 0 ? src_n_real : ctx_len;
-
-    // context positions: [0, 1, ..., n_real-1, 0, 0, ..., 0] (padding gets position 0)
-    if (pos_ctx && pos_ctx->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
-        int32_t * data = (int32_t *) pos_ctx->data;
-        for (int64_t i = 0; i < ctx_len; ++i) {
-            data[i] = (i < n_real) ? (int32_t) i : 0;
-        }
-    }
-
-    // attention mask: real positions visible (0.0f), padding masked (-inf)
-    // mask shape: [ctx_len + n_block, n_block, 1, 1]
-    // K ordering: [ctx_0, ..., ctx_{n-1}, ctx_pad, ..., block_0, ..., block_{b-1}]
-    if (kq_mask && kq_mask->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
-        float * data = (float *) kq_mask->data;
-        const int64_t n_kv = ctx_len + n_block;
-        for (int64_t q = 0; q < n_block; ++q) {
-            for (int64_t k = 0; k < n_kv; ++k) {
-                // mask out padded context positions (between n_real and ctx_len)
-                if (k >= n_real && k < ctx_len) {
-                    data[q * n_kv + k] = -INFINITY;
-                } else {
-                    data[q * n_kv + k] = 0.0f;
+        // pos_ctx: per-slot position patterns [0..n_real_s-1, 0...] repeated
+        if (pos_ctx && pos_ctx->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(pos_ctx->buffer));
+            int32_t * data = (int32_t *) pos_ctx->data;
+            for (int s = 0; s < n_seqs; s++) {
+                const int64_t nr  = slot_info[s].n_real;
+                const int64_t off = (int64_t) s * per_slot_ctx;
+                for (int64_t i = 0; i < per_slot_ctx; i++) {
+                    data[off + i] = (i < nr) ? (int32_t) i : 0;
                 }
             }
         }
-    }
 
-    // Causal SWA: block query q attends to block keys <= q and to real ctx keys
-    // in window [q_pos - n_swa, q_pos]; padded ctx slots are masked.
-    // q_pos comes from ubatch->pos when available, else inferred as n_real + q.
-    if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
-        float * data = (float *) kq_mask_swa->data;
-        const int64_t n_kv   = ctx_len + n_block;
-        const int32_t window = (int32_t) n_swa;
-        const bool    have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
-                               && ((int64_t) ubatch->n_tokens >= n_block);
-        for (int64_t q = 0; q < n_block; ++q) {
-            const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t) (n_real + q);
-            for (int64_t k = 0; k < n_kv; ++k) {
-                float v = 0.0f;
-                if (k < n_real) {
-                    if (q_pos - (int32_t) k > window) v = -INFINITY;
-                } else if (k < ctx_len) {
-                    v = -INFINITY;
-                } else {
-                    const int64_t b_k = k - ctx_len;
-                    if (b_k > q) v = -INFINITY;
+        // kq_mask: per-slot isolation — query in slot S sees only slot S's
+        // cross keys (real only) and slot S's block keys (causal).
+        if (kq_mask && kq_mask->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
+            float * data = (float *) kq_mask->data;
+            const int64_t n_kv = ctx_len + n_block;
+            for (int64_t q = 0; q < n_block; q++) {
+                const int qs = (int)(q / n_seq_tokens);
+                const int ql = (int)(q % n_seq_tokens);
+                const int64_t nr = slot_info[qs].n_real;
+                for (int64_t k = 0; k < n_kv; k++) {
+                    float v = -INFINITY;
+                    if (k < ctx_len) {
+                        const int ks = (int)(k / per_slot_ctx);
+                        const int kl = (int)(k % per_slot_ctx);
+                        if (ks == qs && kl < nr) { v = 0.0f; }
+                    } else {
+                        const int bi = (int)(k - ctx_len);
+                        const int ks = bi / n_seq_tokens;
+                        const int kl = bi % n_seq_tokens;
+                        if (ks == qs && kl <= ql) { v = 0.0f; }
+                    }
+                    data[q * n_kv + k] = v;
                 }
-                data[q * n_kv + k] = v;
+            }
+        }
+
+        // kq_mask_swa: per-slot isolation + sliding window on cross keys
+        if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
+            float * data = (float *) kq_mask_swa->data;
+            const int64_t n_kv   = ctx_len + n_block;
+            const int32_t window = (int32_t) n_swa;
+            const bool have_pos  = (ubatch->pos != nullptr)
+                                 && ((int64_t) ubatch->n_tokens >= n_block);
+            for (int64_t q = 0; q < n_block; q++) {
+                const int qs = (int)(q / n_seq_tokens);
+                const int ql = (int)(q % n_seq_tokens);
+                const int64_t nr = slot_info[qs].n_real;
+                const int32_t q_pos = have_pos ? ubatch->pos[q] : (int32_t)(nr + ql);
+                for (int64_t k = 0; k < n_kv; k++) {
+                    float v = -INFINITY;
+                    if (k < ctx_len) {
+                        const int ks = (int)(k / per_slot_ctx);
+                        const int kl = (int)(k % per_slot_ctx);
+                        if (ks == qs && kl < nr && q_pos - (int32_t) kl <= window) {
+                            v = 0.0f;
+                        }
+                    } else {
+                        const int bi = (int)(k - ctx_len);
+                        const int ks = bi / n_seq_tokens;
+                        const int kl = bi % n_seq_tokens;
+                        if (ks == qs && kl <= ql) { v = 0.0f; }
+                    }
+                    data[q * n_kv + k] = v;
+                }
             }
         }
     }
