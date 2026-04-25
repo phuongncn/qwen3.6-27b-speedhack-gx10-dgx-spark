@@ -62,8 +62,15 @@ struct llama_cparams {
     // Capped at LLAMA_DFLASH_MAX_SLOTS.
     int dflash_n_slots = 1;
 
-    // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync)
+    // GPU-resident tape for DeltaNet rollback (graph writes directly, no eval callback sync).
+    // tape_gpu is non-null when GPU tape is enabled (backward compat sentinel).
     dflash_tape_gpu * tape_gpu = nullptr;
+
+    // B2.6: per-seq tape pointers for multi-seq verify batching.
+    // tape_gpu_seqs[s] = tape for ubatch seq index s (0..tape_gpu_n_seqs-1).
+    // Populated by the decode loop before each process_ubatch().
+    dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
+    int tape_gpu_n_seqs = 0;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

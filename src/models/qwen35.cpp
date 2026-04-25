@@ -356,27 +356,42 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // GPU tape: copy k/v/gate/beta directly to persistent GPU buffer (no eval callback sync)
-    // Skipped for n_seqs > 1: the tape is a per-context singleton buffer, so multi-seq
-    // batches (e.g. llama-server with np > 1 packing multiple slots' prompts) would clobber
-    // each other's entries. Prompt-processing batches don't need the tape anyway — it's
-    // only read during DFlash verify rollback, which runs per-slot with n_seqs == 1.
-    if (cparams.tape_gpu && n_seqs == 1) {
-        auto * tgpu = cparams.tape_gpu;
-        // find tape layer index for this model layer
-        int li = -1;
-        for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
-            if (tgpu->layer_ids[i] == il) { li = i; break; }
-        }
-        if (li >= 0 && n_seq_tokens <= tgpu->max_tokens) {
+    // GPU tape: copy k/v/gate/beta directly to persistent per-slot GPU buffers.
+    // B2.6: per-seq loop — extracts each seq's 3D slice from the 4D source
+    // tensors and copies to that seq's tape buffer. For n_seqs==1 this
+    // degenerates to the pre-B2.6 behavior (single copy set at offset 0).
+    if (cparams.tape_gpu_n_seqs > 0) {
+        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
+            auto * tgpu = cparams.tape_gpu_seqs[s];
+            if (!tgpu) continue;
+
+            int li = -1;
+            for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) {
+                if (tgpu->layer_ids[i] == il) { li = i; break; }
+            }
+            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
+
             auto & tl = tgpu->layers[li];
 
-            // ensure sources are contiguous (v_conv is a non-contiguous view)
-            ggml_tensor * k_cont = ggml_cont_3d(ctx0, k_conv, k_conv->ne[0], k_conv->ne[1], n_seq_tokens);
-            ggml_tensor * v_cont = ggml_cont_3d(ctx0, v_conv, v_conv->ne[0], v_conv->ne[1], n_seq_tokens);
-            ggml_tensor * g_cont = ggml_cont_3d(ctx0, gate, gate->ne[0], gate->ne[1], n_seq_tokens);
-            ggml_tensor * b_cont = ggml_cont_3d(ctx0, beta_presigmoid,
-                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens);
+            // extract per-seq 3D slice from 4D [dim, heads, n_seq_tokens, n_seqs]
+            ggml_tensor * k_slice = ggml_view_3d(ctx0, k_conv,
+                k_conv->ne[0], k_conv->ne[1], n_seq_tokens,
+                k_conv->nb[1], k_conv->nb[2], s * k_conv->nb[3]);
+            ggml_tensor * v_slice = ggml_view_3d(ctx0, v_conv,
+                v_conv->ne[0], v_conv->ne[1], n_seq_tokens,
+                v_conv->nb[1], v_conv->nb[2], s * v_conv->nb[3]);
+            ggml_tensor * g_slice = ggml_view_3d(ctx0, gate,
+                gate->ne[0], gate->ne[1], n_seq_tokens,
+                gate->nb[1], gate->nb[2], s * gate->nb[3]);
+            ggml_tensor * b_slice = ggml_view_3d(ctx0, beta_presigmoid,
+                beta_presigmoid->ne[0], beta_presigmoid->ne[1], n_seq_tokens,
+                beta_presigmoid->nb[1], beta_presigmoid->nb[2], s * beta_presigmoid->nb[3]);
+
+            // make contiguous (v_conv is a non-contiguous view)
+            ggml_tensor * k_cont = ggml_cont(ctx0, k_slice);
+            ggml_tensor * v_cont = ggml_cont(ctx0, v_slice);
+            ggml_tensor * g_cont = ggml_cont(ctx0, g_slice);
+            ggml_tensor * b_cont = ggml_cont(ctx0, b_slice);
 
             // destination views (sliced to actual n_tokens from max_tokens allocation)
             ggml_tensor * k_dst = ggml_view_3d(ctx0, tl.k,

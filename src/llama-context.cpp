@@ -1019,15 +1019,16 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             return true;
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
-            // tape capture is graph-level per-slot — multi-seq ubatches can't
-            // route per-token writes here, so don't intercept on those.
-            if (n_seqs_unq > 1) {
-                return false;
-            }
-            // with GPU tape, only intercept qkv_mixed (others captured by graph)
             if (cap->active_tape()) {
+                // GPU tape: k/v/gate/beta captured by graph-embedded per-seq copies.
+                // Only QKV mixed needs eval callback (for CPU-side conv state rebuild).
+                // Multi-seq is supported — tensor stored with per-seq metadata.
                 auto it = cap->tape_name_map.find(t->name);
                 return (it != cap->tape_name_map.end() && it->second.second == DFLASH_TAPE_QKV);
+            }
+            // CPU tape fallback: no multi-seq support
+            if (n_seqs_unq > 1) {
+                return false;
             }
             return true;
         }
@@ -1134,7 +1135,16 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                     break;
                 case DFLASH_TAPE_QKV:
                     tape.conv_channels = t->ne[0];
-                    tape.n_tokens = (int) t->ne[1]; // also track token count for conv rebuild
+                    tape.n_tokens = (int) t->ne[1]; // tokens per seq (ne[1] of 3D [ch, n_seq_tokens, n_seqs])
+                    if (ub && n_seqs_unq > 1) {
+                        tape.n_seqs = std::min((int) n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
+                        for (int s = 0; s < tape.n_seqs; ++s) {
+                            tape.seq_ids[s] = ub->seq_id_unq[s];
+                        }
+                    } else {
+                        tape.n_seqs = 1;
+                        tape.seq_ids[0] = ub ? ub->seq_id_unq[0] : 0;
+                    }
                     dflash_read_tensor(t, tape.qkv_mixed, n_elem);
                     break;
             }
@@ -1189,11 +1199,10 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     cparams.cb_eval = dflash_eval_callback;
     cparams.cb_eval_user_data = dflash_capture.get();
 
-    // each ubatch must carry exactly one slot's tokens so the per-ubatch
-    // active-slot switch in decode() can route capture + tape writes.
-    if (memory) {
-        memory->set_force_split_seq(true);
-    }
+    // B2.6: force_split_seq no longer needed — GPU tape graph ops, eval
+    // callback hidden scatter, and QKV per-seq metadata all support
+    // multi-seq ubatches. split_equal batching reduces verify latency
+    // for concurrent slots.
 }
 
 void llama_context::dflash_reset_hidden_capture() {
@@ -1249,8 +1258,25 @@ void llama_context::set_tape_recording(bool enable) {
         }
     }
 
-    // expose to graph builder via cparams (tracks the currently active slot)
-    cparams.tape_gpu = (enable && dflash_capture->active_tape()) ? dflash_capture->active_tape() : nullptr;
+    // expose to graph builder via cparams — populate all tape pointers so graph
+    // reservation accounts for worst-case per-seq copy ops (B2.6).
+    if (enable && !dflash_capture->tapes.empty()) {
+        const int n_tapes = (int) dflash_capture->tapes.size();
+        cparams.tape_gpu = dflash_capture->tapes[0].get();
+        cparams.tape_gpu_n_seqs = n_tapes;
+        for (int s = 0; s < n_tapes && s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+            cparams.tape_gpu_seqs[s] = dflash_capture->tapes[s].get();
+        }
+        for (int s = n_tapes; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+            cparams.tape_gpu_seqs[s] = nullptr;
+        }
+    } else {
+        cparams.tape_gpu = nullptr;
+        cparams.tape_gpu_n_seqs = 0;
+        for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+            cparams.tape_gpu_seqs[s] = nullptr;
+        }
+    }
 }
 
 void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
@@ -1367,6 +1393,9 @@ void llama_context::set_active_dflash_slot(int slot_idx) {
     }
     dflash_capture->active_tape_idx = slot_idx;
     cparams.tape_gpu = dflash_capture->active_tape();
+    // sync per-seq array (single-seq mode for external callers)
+    cparams.tape_gpu_seqs[0] = cparams.tape_gpu;
+    cparams.tape_gpu_n_seqs = 1;
     // graph nodes hold references to the previous slot's tape tensors; invalidate
     // so the next decode rebuilds with the new slot's tensors.
     if (gf_res_prev) {
@@ -1610,15 +1639,16 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         dflash_capture->replay_graph_ctx = ctx; // freed in tape_replay_sync
         dflash_capture->replay_n_accepted = n_accepted;
         dflash_capture->replay_cell_idx = cell_idx;
+        dflash_capture->replay_seq_id = seq_id;
         dflash_capture->replay_mem_recurrent = mem_recurrent;
         return; // conv rebuild deferred to tape_replay_sync()
     }
 
 conv_rebuild:
-    tape_replay_conv(mem_recurrent, cell_idx, n_accepted);
+    tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
 }
 
-void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
+void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
@@ -1631,6 +1661,16 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
 
         if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
         if (tape.qkv_mixed.empty() || !mem_recurrent->r_l[il]) continue;
+
+        // B2.6: for multi-seq verify, QKV mixed has per-seq data packed
+        // contiguously as [channels, n_seq_tokens, n_seqs]. Find offset.
+        size_t qkv_seq_offset = 0;
+        if (tape.n_seqs > 1) {
+            for (int s = 0; s < tape.n_seqs; ++s) {
+                if (tape.seq_ids[s] == seq_id) break;
+                qkv_seq_offset += (size_t) tape.n_tokens * (size_t) tape.conv_channels;
+            }
+        }
 
         ggml_tensor * r_tensor = mem_recurrent->r_l[il];
         const size_t r_offset = (size_t)cell_idx * n_embd_r * ggml_element_size(r_tensor);
@@ -1649,7 +1689,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
                 if (src_pos < (int)conv_window) {
                     val = old_window[ch * conv_window + src_pos];
                 } else {
-                    val = tape.qkv_mixed[(src_pos - conv_window) * conv_ch + ch];
+                    val = tape.qkv_mixed[qkv_seq_offset + (src_pos - conv_window) * conv_ch + ch];
                 }
                 new_conv[ch * conv_window + w] = val;
             }
@@ -1676,7 +1716,8 @@ void llama_context::tape_replay_sync() {
     // finish conv rebuild + position advance
     tape_replay_conv(dflash_capture->replay_mem_recurrent,
                      dflash_capture->replay_cell_idx,
-                     dflash_capture->replay_n_accepted);
+                     dflash_capture->replay_n_accepted,
+                     dflash_capture->replay_seq_id);
 
     dflash_capture->replay_pending = false;
 }
@@ -2939,14 +2980,46 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // DFlash: hand the eval callback this ubatch so it can route hidden-state
         // captures per-token (multi-seq) or whole-tensor (single-seq) to the
-        // correct layer_hiddens slot. Tape capture is graph-level per-slot, so
-        // also switch the active tape slot for single-seq ubatches.
+        // correct layer_hiddens slot. Populate per-seq tape pointers for the
+        // graph builder so GPU tape copies target the correct per-slot buffers.
         if (dflash_capture) {
             dflash_capture->ubatch = &ubatch;
+
+            // populate per-seq tape pointers for graph builder (B2.6)
+            if (!dflash_capture->tapes.empty()) {
+                const int ns = std::min((int) ubatch.n_seqs, (int) LLAMA_DFLASH_MAX_SLOTS);
+                bool seqs_changed = (ns != cparams.tape_gpu_n_seqs);
+                cparams.tape_gpu_n_seqs = ns;
+
+                for (int s = 0; s < ns; ++s) {
+                    const llama_seq_id seq = ubatch.seq_id_unq[s];
+                    dflash_tape_gpu * tp = nullptr;
+                    if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
+                        tp = dflash_capture->tapes[seq].get();
+                    }
+                    if (tp != cparams.tape_gpu_seqs[s]) {
+                        seqs_changed = true;
+                    }
+                    cparams.tape_gpu_seqs[s] = tp;
+                }
+                for (int s = ns; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                    cparams.tape_gpu_seqs[s] = nullptr;
+                }
+
+                // sentinel for "GPU tape is enabled"
+                cparams.tape_gpu = cparams.tape_gpu_seqs[0];
+
+                // graph nodes hold references to tape tensors — invalidate if set changed
+                if (seqs_changed && gf_res_prev) {
+                    gf_res_prev->reset();
+                }
+            }
+
+            // track active slot for single-seq (used by active_tape() in eval callback)
             if (ubatch.n_seqs_unq == 1) {
                 const llama_seq_id seq = ubatch.seq_id_unq[0];
                 if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
-                    set_active_dflash_slot(seq);
+                    dflash_capture->active_tape_idx = seq;
                 }
             }
         }

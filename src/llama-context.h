@@ -49,10 +49,13 @@ struct dflash_tape_layer {
     std::vector<float> v;          // [S_v * H_v * n_tokens]
     std::vector<float> gate;       // [H_v * n_tokens] pre-exp
     std::vector<float> beta;       // [H_v * n_tokens] pre-sigmoid
-    std::vector<float> qkv_mixed;  // [conv_channels * n_tokens] for conv state rebuild
+    std::vector<float> qkv_mixed;  // [conv_channels * n_tokens * n_seqs] for conv state rebuild
     int64_t S_k = 0, H_k = 0, S_v = 0, H_v = 0;
     int64_t conv_channels = 0;
     int n_tokens = 0;
+    // B2.6: per-seq metadata for multi-seq verify QKV scatter
+    int n_seqs = 1;
+    llama_seq_id seq_ids[LLAMA_DFLASH_MAX_SLOTS] = {};
 };
 
 // GPU-resident tape: persistent tensors that the graph writes into directly (no eval callback sync)
@@ -154,6 +157,7 @@ struct dflash_capture_data {
     ggml_context * replay_graph_ctx = nullptr;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
+    llama_seq_id replay_seq_id = 0;
     llama_memory_recurrent * replay_mem_recurrent = nullptr;
 
     ~dflash_capture_data() {
@@ -407,7 +411,7 @@ public:
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
     void tape_replay(llama_seq_id seq_id, int n_accepted);
     void tape_replay_sync();
-    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
