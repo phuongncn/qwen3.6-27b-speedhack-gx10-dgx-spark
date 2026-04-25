@@ -2187,6 +2187,22 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // DFlash: narrow the shared drafter graph when fewer than max slots are
+        // actively drafting. When only 1 slot drafts, the graph builder uses
+        // B1-style dynamic bucketing (~128-256 ctx_len) instead of the fixed
+        // n_slots×512 width — recovering single-slot throughput on np>1 servers.
+        // The idempotent set_dflash_n_slots call costs nothing when unchanged
+        // and triggers one sched_need_reserve per transition.
+        if (ctx_dft_shared) {
+            int n_drafting = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+                    n_drafting++;
+                }
+            }
+            llama_set_dflash_n_slots(ctx_dft_shared.get(), std::max(1, n_drafting));
+        }
+
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
