@@ -662,9 +662,13 @@ private:
         params_base = params;
 
         // Extra seq slots for recurrent state backup during speculative decoding:
-        // slot i backs up to seq_id = i + n_parallel_user
+        // slot i backs up to seq_id = i + n_parallel_user.
+        // Gate on has_dft() rather than speculative.type because DFlash is auto-detected
+        // from the drafter model arch *after* common_init_from_params runs — if we
+        // gated on type alone, an unflagged --draft-type would leave n_seq_max=n_parallel_user,
+        // and seq_backup writes at slot.id + n_parallel_user would silently corrupt state.
         n_parallel_user = params_base.n_parallel;
-        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
             params_base.n_parallel = n_parallel_user * 2;
             SRV_INF("speculative decoding: bumping n_seq_max from %d to %d for recurrent state backup\n",
                     n_parallel_user, params_base.n_parallel);
@@ -699,12 +703,6 @@ private:
             params_dft.n_parallel   = 1;
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
-            // DFlash drafter only processes block_size (=16) tokens per call — cap
-            // drafter ubatch so users who opt into a larger target -ub (for faster
-            // prompt prefill) don't also inflate the drafter's graph reservation.
-            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                params_dft.n_ubatch = std::min(params_dft.n_ubatch, (int32_t)64);
-            }
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams_dft;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
@@ -724,6 +722,21 @@ private:
             if (model_dft == nullptr) {
                 SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                 return false;
+            }
+
+            // Auto-detect DFlash from drafter model architecture (mirrors speculative-simple CLI)
+            if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
+                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
+                        llama_model_dflash_block_size(model_dft.get()));
+            }
+
+            // DFlash drafter only processes block_size (=16) tokens per call — cap
+            // drafter ubatch so users who opt into a larger target -ub (for faster
+            // prompt prefill) don't also inflate the drafter's graph reservation.
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_dft.n_ubatch = std::min(params_dft.n_ubatch, (int32_t)64);
             }
 
             params_base.speculative.model_dft = model_dft.get();
@@ -3052,6 +3065,20 @@ private:
 
                 // the accepted tokens from the speculation
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+
+                // update DFlash hidden state ring + CopySpec prompt window with accepted tokens.
+                // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
+                // slot.drafted so batch_tokens reflects the full verification batch [id_last, drafts].
+                {
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        llama_dflash_set_active_slot(ctx, slot.id);
+                    }
+                    llama_tokens batch_tokens;
+                    batch_tokens.push_back(slot.sampled);
+                    batch_tokens.insert(batch_tokens.end(), slot.drafted.begin(), slot.drafted.end());
+                    common_speculative_update_logits(slot.spec, ctx, batch_tokens, (int) ids.size());
+                }
+
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
@@ -3121,15 +3148,6 @@ private:
                     slot.has_draft_backup = false;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
-                }
-
-                // update DFlash hidden state ring buffer with accepted tokens' hidden states
-                {
-                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                        llama_dflash_set_active_slot(ctx, slot.id);
-                    }
-                    llama_tokens batch_tokens = { slot.sampled };
-                    common_speculative_update_logits(slot.spec, ctx, batch_tokens, (int) ids.size());
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
