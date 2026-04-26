@@ -1,7 +1,17 @@
 #include "gated_delta_net.cuh"
 
+// RDNA3 wants 1 block/SM here: with 2 blocks/SM the compiler is forced under
+// ~128 VGPR/lane and spills on this kernel. 1 block/SM raises the per-lane
+// VGPR budget to ~256 and eliminates the spill entirely. CUDA keeps 2.
+// See llama.cpp issue #20354 (GATED_DELTA_NET HIP underperforms on RDNA3).
+#if defined(GGML_USE_HIP)
+#define GGML_GDN_MIN_BLOCKS_PER_SM 1
+#else
+#define GGML_GDN_MIN_BLOCKS_PER_SM 2
+#endif
+
 template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -279,7 +289,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 #define GDN_TREE_ROOT_PARENT (-1)
 
 template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
 gated_delta_net_tree_cuda(const float * q,
                           const float * k,
                           const float * v,

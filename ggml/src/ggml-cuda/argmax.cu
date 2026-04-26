@@ -80,8 +80,8 @@ static __global__ void argmax_f32(
     // Warp reduction for argmax
 #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-        const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
-        const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+        const float val = __shfl_xor_sync(0xFFFFFFFFULL, maxval, offset, WARP_SIZE);
+        const int   col = __shfl_xor_sync(0xFFFFFFFFULL, argmax, offset, WARP_SIZE);
         if (val > maxval) {
             maxval = val;
             argmax = col;
@@ -92,8 +92,8 @@ static __global__ void argmax_f32(
     if (output_logprob) {
 #pragma unroll
         for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-            float other_max = __shfl_xor_sync(0xFFFFFFFF, logit_max, offset, WARP_SIZE);
-            float other_sum = __shfl_xor_sync(0xFFFFFFFF, sum_exp, offset, WARP_SIZE);
+            float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+            float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
             if (other_max > logit_max) {
                 sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
                 logit_max = other_max;
@@ -142,16 +142,16 @@ static __global__ void argmax_f32(
 
 #pragma unroll
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-                float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
-                int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+                float val = __shfl_xor_sync(0xFFFFFFFFULL, maxval, offset, WARP_SIZE);
+                int   col = __shfl_xor_sync(0xFFFFFFFFULL, argmax, offset, WARP_SIZE);
                 if (val > maxval) {
                     maxval = val;
                     argmax = col;
                 }
 
                 if (output_logprob) {
-                    float other_max = __shfl_xor_sync(0xFFFFFFFF, logit_max, offset, WARP_SIZE);
-                    float other_sum = __shfl_xor_sync(0xFFFFFFFF, sum_exp, offset, WARP_SIZE);
+                    float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+                    float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
                     if (other_max > logit_max) {
                         sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
                         logit_max = other_max;
@@ -262,8 +262,8 @@ static __global__ void topk_f32(
     // Each step: lane gets partner's min element, if it beats our min, replace and re-heapify
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         for (int i = 0; i < K; i++) {
-            float partner_val = __shfl_xor_sync(0xFFFFFFFF, heap_val[i], offset);
-            int partner_idx = __shfl_xor_sync(0xFFFFFFFF, heap_idx[i], offset);
+            float partner_val = __shfl_xor_sync(0xFFFFFFFFULL, heap_val[i], offset);
+            int partner_idx = __shfl_xor_sync(0xFFFFFFFFULL, heap_idx[i], offset);
             if (partner_val > heap_val[0]) {
                 heap_val[0] = partner_val;
                 heap_idx[0] = partner_idx;
@@ -343,8 +343,8 @@ static __global__ void topk_f32(
         // Single warp: reduce softmax within warp
         if (output_logprob) {
             for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-                float other_max = __shfl_xor_sync(0xFFFFFFFF, logit_max, offset, WARP_SIZE);
-                float other_sum = __shfl_xor_sync(0xFFFFFFFF, sum_exp, offset, WARP_SIZE);
+                float other_max = __shfl_xor_sync(0xFFFFFFFFULL, logit_max, offset, WARP_SIZE);
+                float other_sum = __shfl_xor_sync(0xFFFFFFFFULL, sum_exp, offset, WARP_SIZE);
                 if (other_max > logit_max) {
                     sum_exp = sum_exp * expf(logit_max - other_max) + other_sum;
                     logit_max = other_max;

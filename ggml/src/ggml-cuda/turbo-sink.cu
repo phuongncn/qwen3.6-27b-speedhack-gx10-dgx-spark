@@ -1,5 +1,7 @@
 #include "turbo-sink.cuh"
+#if !defined(GGML_USE_HIP)
 #include <cuda_runtime.h>
+#endif
 #include <cstdlib>
 #include <cstdio>
 #include <unordered_map>
