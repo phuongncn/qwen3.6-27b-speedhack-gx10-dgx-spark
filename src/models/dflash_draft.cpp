@@ -42,8 +42,9 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
 
     if (n_seqs == 1) {
         // === Single-slot path ===
-        // resolve cross data for the active seq
+        // resolve cross data for the active seq (GPU path preferred, CPU fallback)
         const float * src_data  = nullptr;
+        const void *  src_gpu   = nullptr;
         int64_t       src_n_enc  = 0;
         int64_t       src_n_real = 0;
         if (cross) {
@@ -53,16 +54,28 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             }
             if (active_seq >= 0) {
                 auto it = cross->v_embd_per_seq.find(active_seq);
-                if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
-                    src_data   = it->second.v_embd.data();
-                    src_n_enc  = it->second.n_enc;
-                    src_n_real = it->second.n_enc_real;
+                if (it != cross->v_embd_per_seq.end()) {
+                    if (it->second.v_embd_gpu) {
+                        src_gpu    = it->second.v_embd_gpu;
+                        src_n_enc  = it->second.n_enc;
+                        src_n_real = it->second.v_embd_gpu_n_enc_real;
+                    } else if (!it->second.v_embd.empty()) {
+                        src_data   = it->second.v_embd.data();
+                        src_n_enc  = it->second.n_enc;
+                        src_n_real = it->second.n_enc_real;
+                    }
                 }
             }
-            if (!src_data && !cross->v_embd.empty()) {
-                src_data   = cross->v_embd.data();
-                src_n_enc  = cross->n_enc;
-                src_n_real = cross->n_enc_real;
+            if (!src_data && !src_gpu) {
+                if (cross->v_embd_gpu) {
+                    src_gpu    = cross->v_embd_gpu;
+                    src_n_enc  = cross->n_enc;
+                    src_n_real = cross->v_embd_gpu_n_enc_real;
+                } else if (!cross->v_embd.empty()) {
+                    src_data   = cross->v_embd.data();
+                    src_n_enc  = cross->n_enc;
+                    src_n_real = cross->n_enc_real;
+                }
             }
         }
 
@@ -71,12 +84,21 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const int64_t n_copy  = std::min(src_real, ctx_len);
         const int64_t win_off = (src_real > ctx_len) ? (src_real - ctx_len) : 0;
 
-        if (target_hidden && src_data && n_copy > 0) {
+        if (target_hidden && (src_data || src_gpu) && n_copy > 0) {
             const int64_t n_feat = cross->n_embd;
-            const float * src = src_data + win_off * n_feat;
             const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
-            ggml_backend_tensor_set(target_hidden, src, 0, std::min(copy_bytes, tensor_bytes));
+            const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
+
+            if (src_gpu && cross->fn_set_tensor_d2d) {
+                // GPU D2D path
+                const void * gpu_src = (const char *)src_gpu + (size_t)win_off * n_feat * sizeof(float);
+                cross->fn_set_tensor_d2d(target_hidden->data, gpu_src, 0, actual_bytes);
+            } else {
+                // CPU H2D path (fallback)
+                const float * src = src_data + win_off * n_feat;
+                ggml_backend_tensor_set(target_hidden, src, 0, actual_bytes);
+            }
             if (copy_bytes < tensor_bytes) {
                 ggml_backend_tensor_memset(target_hidden, 0, copy_bytes, tensor_bytes - copy_bytes);
             }

@@ -428,6 +428,14 @@ public:
     // routes to the legacy single-slot path (set_cross_data).
     void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // DFlash GPU ring: allocate ring on GPU backend, returns opaque handle
+    void * init_cross_ring_gpu(int n_layers, int n_embd, int ring_size);
+
+    // DFlash GPU ring: set GPU device pointer as cross data source (D2D path)
+    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
+    void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
+                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+
     // DDTree: set/clear tree attention mask for verification
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();

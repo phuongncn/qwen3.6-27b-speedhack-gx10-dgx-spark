@@ -1244,6 +1244,33 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // A2: sliding window limit for drafter context (0 = unlimited)
     static constexpr int ctx_window = LLAMA_DFLASH_PER_SLOT_CTX;
 
+    // GPU cross-attention ring (nullptr = CPU fallback)
+    void * gpu_ring_handle = nullptr;
+
+    // build interleaved cross-attention data from ring buffer (GPU or CPU path)
+    int build_cross_data(llama_context * ctx) {
+        if (gpu_ring_handle) {
+            int gpu_write_pos = ring_write_pos % ctx_window;
+            int gpu_filled = std::min(ring_filled, ctx_window);
+            llama_dflash_cross_ring_gpu_set_cross(ctx, gpu_ring_handle, seq_id,
+                gpu_write_pos, gpu_filled, n_target_layers, n_embd, ctx_window);
+            return gpu_filled;
+        }
+        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
+        cross_buf.resize((size_t)n_target_features * cross_len);
+        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
+        for (int t = 0; t < cross_len; ++t) {
+            int slot = (read_start + t) % RING_SIZE;
+            for (int layer = 0; layer < n_target_layers; ++layer) {
+                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
+                       ring_buf[layer].data() + (size_t)slot * n_embd,
+                       n_embd * sizeof(float));
+            }
+        }
+        llama_set_cross_data_seq(ctx, seq_id, cross_buf.data(), n_target_features, cross_len);
+        return cross_len;
+    }
+
     llama_batch batch_dft;
 
     common_speculative_state_dflash(
@@ -1278,11 +1305,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         batch_dft = llama_batch_init(block_size, 0, 1);
 
+        // try to allocate GPU ring buffer on drafter's GPU
+        gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, ctx_window);
+        if (gpu_ring_handle) {
+            LOG_INF("dflash: GPU cross ring enabled (%d layers x %d slots x %d embd)\n",
+                    n_target_layers, ctx_window, n_embd);
+        }
+
         LOG_INF("dflash: block_size=%d, mask_token=%d, n_target_layers=%d, n_embd=%d\n",
                 block_size, mask_token_id, n_target_layers, n_embd);
     }
 
     ~common_speculative_state_dflash() override {
+        llama_dflash_cross_ring_gpu_free(gpu_ring_handle);
         llama_batch_free(batch_dft);
         if (owns_ctx_dft) {
             llama_free(ctx_dft);
@@ -1300,21 +1335,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return -1;
         }
 
-        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
-        cross_buf.resize((size_t)n_target_features * cross_len);
-
-        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
-        for (int t = 0; t < cross_len; ++t) {
-            int slot = (read_start + t) % RING_SIZE;
-            for (int layer = 0; layer < n_target_layers; ++layer) {
-                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
-                       ring_buf[layer].data() + (size_t)slot * n_embd,
-                       n_embd * sizeof(float));
-            }
-        }
-
-        llama_set_cross_data_seq(ctx_dft_ext, seq_id, cross_buf.data(), n_target_features, cross_len);
-        return cross_len;
+        return build_cross_data(ctx_dft_ext);
     }
 
     // called after initial prefill — extract hidden states from target
@@ -1421,6 +1442,23 @@ struct common_speculative_state_dflash : public common_speculative_state {
             src += layer_bytes;
         }
 
+        // sync GPU ring with restored CPU ring — batch per layer to avoid N*L individual H2D calls
+        if (gpu_ring_handle) {
+            int gpu_entries = std::min(ring_filled, ctx_window);
+            std::vector<float> tmp((size_t)gpu_entries * n_embd);
+            for (int l = 0; l < n_target_layers; ++l) {
+                for (int t = 0; t < gpu_entries; ++t) {
+                    int cpu_slot = (ring_write_pos - gpu_entries + t + RING_SIZE) % RING_SIZE;
+                    memcpy(tmp.data() + (size_t)t * n_embd,
+                           ring_buf[l].data() + (size_t)cpu_slot * n_embd,
+                           n_embd * sizeof(float));
+                }
+                int gpu_pos = ((ring_write_pos - gpu_entries) % ctx_window + ctx_window) % ctx_window;
+                llama_dflash_cross_ring_gpu_write(gpu_ring_handle, l, gpu_pos,
+                    tmp.data(), gpu_entries, n_embd);
+            }
+        }
+
         // mark as flushed so subsequent flush_prefill() calls from suffix
         // decoding APPEND to the restored ring instead of resetting it
         prefill_flushed = true;
@@ -1443,26 +1481,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t0 = ggml_time_us();
 
-        // Build interleaved cross-attention buffer from ring
-        // Only extract last ctx_window tokens (or all available if fewer)
-        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
-        cross_buf.resize((size_t)n_target_features * cross_len);
-
-        // Read position: start reading (cross_len) tokens back from ring_write_pos
-        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
-
-        for (int t = 0; t < cross_len; ++t) {
-            int slot = (read_start + t) % RING_SIZE;
-            for (int layer = 0; layer < n_target_layers; ++layer) {
-                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
-                       ring_buf[layer].data() + (size_t)slot * n_embd,
-                       n_embd * sizeof(float));
-            }
-        }
+        int cross_len = build_cross_data(ctx_dft);
 
         const int64_t t1 = ggml_time_us();
-
-        llama_set_cross_data_seq(ctx_dft, seq_id, cross_buf.data(), n_target_features, cross_len);
 
         // build drafter batch: [id_last, mask, mask, ..., mask]
         // positions are relative to the context window fed to the drafter
@@ -1541,23 +1562,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // --- begin shared draft setup ---
         const int64_t t0 = ggml_time_us();
 
-        // Build interleaved cross-attention buffer from ring
-        int cross_len = std::min(ring_filled, ctx_window > 0 ? ctx_window : ring_filled);
-        cross_buf.resize((size_t)n_target_features * cross_len);
-
-        int read_start = (ring_write_pos - cross_len + RING_SIZE) % RING_SIZE;
-        for (int t = 0; t < cross_len; ++t) {
-            int slot = (read_start + t) % RING_SIZE;
-            for (int layer = 0; layer < n_target_layers; ++layer) {
-                memcpy(&cross_buf[(size_t)(layer * n_embd) + (size_t)t * n_target_features],
-                       ring_buf[layer].data() + (size_t)slot * n_embd,
-                       n_embd * sizeof(float));
-            }
-        }
-
-        const float * cross_data = cross_buf.data();
-
-        llama_set_cross_data_seq(ctx_dft, seq_id, cross_data, n_target_features, cross_len);
+        int cross_len = build_cross_data(ctx_dft);
 
         common_batch_clear(batch_dft);
         common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
@@ -1739,6 +1744,13 @@ private:
                 memcpy(ring_buf[layer].data() + (size_t)slot * embd,
                        data + (size_t)(src_offset + t) * embd,
                        embd * sizeof(float));
+            }
+
+            // GPU ring upload (capture buffer is contiguous, write fn handles wrap)
+            if (gpu_ring_handle && to_write > 0) {
+                int gpu_pos = ring_write_pos % ctx_window;
+                llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
+                    data + (size_t)src_offset * embd, to_write, embd);
             }
         }
         ring_write_pos = (ring_write_pos + n_tokens) % RING_SIZE;

@@ -1144,6 +1144,12 @@ extern "C" {
     // to the single-slot path (same as llama_set_cross_data).
     LLAMA_API void llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
 
+    // DFlash GPU cross-attention ring: keep ring buffer on GPU, interleave with CUDA kernel
+    LLAMA_API void * llama_dflash_cross_ring_gpu_init(struct llama_context * ctx, int n_layers, int n_embd, int ring_size);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_free(void * handle);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend
     // n_tree_tokens: number of tokens in the tree batch (root + nodes)

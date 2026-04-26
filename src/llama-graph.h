@@ -71,6 +71,11 @@ struct llama_cross {
     // Single-slot / encoder-decoder path: graph builders read from here directly.
     std::vector<float> v_embd;
 
+    // GPU D2D path: device pointer to interleaved cross data (set by GPU ring interleave)
+    const void * v_embd_gpu = nullptr;
+    int64_t v_embd_gpu_n_enc_real = 0;
+    void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+
     // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot
     // instead of reading v_embd. Empty ⇒ fall through to the legacy v_embd path.
@@ -78,6 +83,8 @@ struct llama_cross {
         int64_t n_enc      = 0;  // padded length (graph stability)
         int64_t n_enc_real = 0;  // actual data length
         std::vector<float> v_embd;
+        const void * v_embd_gpu = nullptr;
+        int64_t v_embd_gpu_n_enc_real = 0;
     };
     std::map<llama_seq_id, seq_cross> v_embd_per_seq;
 
