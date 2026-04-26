@@ -530,6 +530,7 @@ private:
     // DDTree: tree-mode parent IDs and persistent SSM intermediate buffers
     struct {
         bool active = false;
+        bool disabled = false;                     // multi-GPU: tree ops can't span devices
         int n_tokens = 0;
         int n_seq0_tokens = 0;                     // tokens on seq_id=0 in last batch (for pos rollback)
         std::vector<int32_t> parent_ids_cpu;       // [max_tree_tokens] host copy

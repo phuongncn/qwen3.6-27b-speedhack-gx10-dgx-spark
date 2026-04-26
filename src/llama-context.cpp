@@ -1932,10 +1932,16 @@ void llama_context::clear_tree_mask() {
 }
 
 void llama_context::set_tree_parent_ids(const int32_t * parents, int n_tokens) {
+    if (tree_bufs.disabled) {
+        return; // multi-GPU: silently use flat chain verify
+    }
     if (tree_bufs.max_tree_tokens < n_tokens) {
         // Allocate or reallocate — use exact size + small margin
         int alloc_size = n_tokens + 4;
         allocate_tree_buffers(alloc_size);
+    }
+    if (tree_bufs.disabled) {
+        return; // allocate_tree_buffers detected multi-GPU
     }
     if (n_tokens > tree_bufs.max_tree_tokens) {
         LLAMA_LOG_WARN("%s: tree buffers too small (%d > %d), falling back to flat verify\n",
@@ -1959,8 +1965,24 @@ void llama_context::clear_tree_parent_ids() {
 }
 
 void llama_context::allocate_tree_buffers(int max_tree_tokens) {
+    if (tree_bufs.disabled) {
+        return;
+    }
     if (tree_bufs.max_tree_tokens >= max_tree_tokens) {
         return; // already allocated enough
+    }
+
+    // Tree verify buffers live on GPU 0. When the model is split across multiple
+    // GPUs, recurrent layers on other devices can't read parent_ids from GPU 0,
+    // so the scheduler aborts. Disable tree mode and use the regular SSM_CONV +
+    // GATED_DELTA_NET kernels instead. The verify batch is still processed in a
+    // single llama_decode call — only the recurrent kernel changes, and for
+    // linear chains the sequential kernel produces identical results.
+    if (model.n_devices() > 1) {
+        LLAMA_LOG_INFO("%s: multi-GPU detected (%zu devices) — disabling tree verify, using flat chain\n",
+                       __func__, model.n_devices());
+        tree_bufs.disabled = true;
+        return;
     }
 
     // Free existing
@@ -2027,9 +2049,10 @@ void llama_context::allocate_tree_buffers(int max_tree_tokens) {
     tree_bufs.buffer = ggml_backend_alloc_ctx_tensors_from_buft(tree_bufs.ggml_ctx, buft);
 
     if (!tree_bufs.buffer) {
-        LLAMA_LOG_ERROR("%s: failed to allocate tree verify buffers (%.1f MB)\n", __func__,
+        LLAMA_LOG_WARN("%s: failed to allocate tree verify buffers (%.1f MB) — using flat chain verify\n", __func__,
                         total_bytes / (1024.0 * 1024.0));
         tree_bufs.max_tree_tokens = 0;
+        tree_bufs.disabled = true;
         ggml_free(tree_bufs.ggml_ctx);
         tree_bufs.ggml_ctx = nullptr;
         return;
