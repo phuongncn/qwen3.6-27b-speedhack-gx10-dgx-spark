@@ -582,6 +582,8 @@ private:
     // rejecting draft tokens, because the recurrent state cannot be rolled back
     bool needs_reeval = false;
     int  n_parallel_user = 0;
+    int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
+    bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -661,17 +663,17 @@ private:
 
         params_base = params;
 
-        // Extra seq slots for recurrent state backup during speculative decoding:
+        // Recurrent state backup for speculative decoding:
         // slot i backs up to seq_id = i + n_parallel_user.
-        // Gate on has_dft() rather than speculative.type because DFlash is auto-detected
-        // from the drafter model arch *after* common_init_from_params runs — if we
-        // gated on type alone, an unflagged --draft-type would leave n_seq_max=n_parallel_user,
-        // and seq_backup writes at slot.id + n_parallel_user would silently corrupt state.
+        // Init with full 2*n_parallel (needed for graph reservation), then shrink
+        // recurrent state to n_parallel to free ~599 MiB VRAM during prefill.
+        // Expanded back to 2*n_parallel before first speculative draft.
         n_parallel_user = params_base.n_parallel;
+        recurrent_expanded = true;
         if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
             params_base.n_parallel = n_parallel_user * 2;
-            SRV_INF("speculative decoding: bumping n_seq_max from %d to %d for recurrent state backup\n",
-                    n_parallel_user, params_base.n_parallel);
+            n_seq_max_full = params_base.n_parallel;
+            recurrent_expanded = false;
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1045,6 +1047,17 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+        }
+
+        // Shrink recurrent state to free backup cells during prefill.
+        // Must happen after init-time decodes (common_speculative_is_compat, warmup)
+        // so the scheduler's CUDA graph state isn't stale.
+        if (!recurrent_expanded && needs_reeval) {
+            auto * mem = llama_get_memory(ctx);
+            if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
+                SRV_INF("shrunk recurrent state to %d cells for prefill (deferred %d backup cells)\n",
+                        n_parallel_user, n_seq_max_full - n_parallel_user);
+            }
         }
 
         return true;
@@ -2315,6 +2328,15 @@ private:
                             llama_set_tree_parent_ids(ctx, linear_parents.data(), n_batch_tokens);
                         }
 
+                        if (!recurrent_expanded) {
+                            auto * mem = llama_get_memory(ctx);
+                            if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
+                                SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+                            } else {
+                                SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                            }
+                            recurrent_expanded = true;
+                        }
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);

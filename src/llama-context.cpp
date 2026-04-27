@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4961,6 +4962,24 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))      return h->get_mem_recr();
+    if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) return h->get_mem_recr();
+    return dynamic_cast<llama_memory_recurrent *>(mem);
+}
+
+bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max) {
+    if (!mem) return false;
+    auto * recr = get_recurrent_mem(mem);
+    return recr ? recr->expand(new_n_seq_max) : true;
+}
+
+bool llama_memory_recurrent_shrink(llama_memory_t mem, uint32_t new_n_seq_max) {
+    if (!mem) return false;
+    auto * recr = get_recurrent_mem(mem);
+    return recr ? recr->shrink(new_n_seq_max) : true;
 }
 
 // llama state API
