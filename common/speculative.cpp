@@ -414,7 +414,7 @@ struct common_speculative_state_draft : public common_speculative_state {
 
         prompt_dft.push_back(id_last);
 
-        LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
+        //LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx_dft, prompt_dft).c_str());
 
         llama_decode(ctx_dft, batch);
 
@@ -438,14 +438,14 @@ struct common_speculative_state_draft : public common_speculative_state {
 
             common_sampler_accept(smpl, id, true);
 
-            result.push_back(id);
-
-            if (params.n_max <= (int) result.size()) {
+            // only collect very high-confidence draft tokens
+            if (cur_p->data[0].p < sparams.p_min) {
                 break;
             }
 
-            // only collect very high-confidence draft tokens
-            if (cur_p->data[0].p < params.p_min) {
+            result.push_back(id);
+
+            if (sparams.n_max <= (int) result.size()) {
                 break;
             }
 
