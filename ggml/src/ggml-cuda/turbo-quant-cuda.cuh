@@ -1047,6 +1047,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         const float * __restrict__ src0, const idx_t * __restrict__ src1,
         block_turbo2_tcq * __restrict__ dst, const int64_t ne_total_groups,
         uint8_t * __restrict__ bt_buf,
+        const int use_shared_bt,
         const int64_t ne00, const int64_t ne01, const int64_t ne02,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -1073,11 +1074,15 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     block_turbo2_tcq * dst_blk = (block_turbo2_tcq *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3)
                                + (i00 / QK_TURBO2_TCQ);
 
+    // Backtrace: one predecessor byte per 64 low-state groups per step.
+    // The predecessor depends only on sid's low 6 bits (same as turbo3_tcq).
+    extern __shared__ uint8_t bt_shared[];
     __shared__ float x[128];
     __shared__ float cost[256];
     __shared__ float cost_b[256];   // double-buffering for Viterbi
     __shared__ int warp_min_idx[8];
     __shared__ float warp_min_cost[8];
+    __shared__ float pred_min_cost[64];
     __shared__ int shared_initial_state;
 
     if (sid < 128) x[sid] = grp_src[sid];
@@ -1121,17 +1126,30 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     if (sid < 128) x[sid] *= inv_norm;
     __syncthreads();
 
-    // FWHT
-    if (sid < 128) x[sid] *= d_turbo_wht_signs1[sid];
-    __syncthreads();
-    for (int h = 1; h < 128; h *= 2) {
-        if (sid < 64) {
-            int j = (sid / h) * (2 * h) + (sid % h);
-            float a = x[j], b = x[j + h];
-            x[j] = a + b; x[j + h] = a - b;
+    // FWHT. The first five stages use warp shuffles, the two cross-warp stages
+    // use shared memory (same approach as turbo3_tcq).
+    if (sid < 128) {
+        float v = x[sid] * d_turbo_wht_signs1[sid];
+        const int lane = sid & 31;
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFFULL, v, h);
+            v = (lane & h) ? (other - v) : (v + other);
         }
-        __syncthreads();
+        x[sid] = v;
     }
+    __syncthreads();
+    if (sid < 64) {
+        const int j = ((sid >> 5) << 6) + (sid & 31);
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b; x[j + 32] = a - b;
+    }
+    __syncthreads();
+    if (sid < 64) {
+        float a = x[sid], b = x[sid + 64];
+        x[sid] = a + b; x[sid + 64] = a - b;
+    }
+    __syncthreads();
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     if (sid < 128) x[sid] *= inv_sqrt_128 * d_turbo_wht_signs2[sid];
     __syncthreads();
@@ -1143,7 +1161,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     float saved_norm = cost[0];
 
     // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
-    uint8_t * bt = bt_buf + (int64_t)blockIdx.x * (128 * 256);
+    uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
     cost[sid] = 0.0f;
     __syncthreads();
 
@@ -1153,24 +1171,31 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
 
         float xt = x[t];
 
-        // Right-shift trellis (k=2, L=8): ns = (prev >> 2) | (out << 6)
-        // Predecessors of sid: prev = ((sid & 0x3F) << 2) | p, for p = 0..3
-        int base_prev = (sid & 0x3F) << 2;
+        // Right-shift trellis (k=2, L=8): ns = (prev >> 2) | (out << 6).
+        // The best predecessor depends only on sid's low 6 bits, so compute
+        // those 64 minima once instead of repeating the same 4-way scan per state.
+        if (sid < 64) {
+            const int base_prev = sid << 2;
+            float best = cost_rd[base_prev];
+            int best_p = 0;
+#pragma unroll
+            for (int p = 1; p < 4; p++) {
+                float c = cost_rd[base_prev | p];
+                if (c < best) {
+                    best = c;
+                    best_p = p;
+                }
+            }
+            pred_min_cost[sid] = best;
+            bt[t * 64 + sid] = (uint8_t) best_p;
+        }
+        __syncthreads();
+
+        const int pred_idx = sid & 0x3F;
         float dist = xt - d_turbo2_tcq_codebook[sid];
         dist = dist * dist;
 
-        float best = 1e30f;
-        int best_p = 0;
-        for (int p = 0; p < 4; p++) {
-            float c = cost_rd[base_prev | p];
-            if (c < best) {
-                best = c;
-                best_p = p;
-            }
-        }
-
-        cost_wr[sid] = best + dist;
-        bt[t * 256 + sid] = (uint8_t)best_p;
+        cost_wr[sid] = pred_min_cost[pred_idx] + dist;
         __syncthreads();
     }
     // After 128 steps (even count): final costs in cost[]
@@ -1191,13 +1216,21 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         }
     }
     __syncthreads();
-    if (sid == 0) {
-        float best = warp_min_cost[0];
-        int best_idx = warp_min_idx[0];
-        for (int w = 1; w < 8; w++) {
-            if (warp_min_cost[w] < best) { best = warp_min_cost[w]; best_idx = warp_min_idx[w]; }
+    if (sid < 32) {
+        float best = (sid < 8) ? warp_min_cost[sid] : 3.4028234663852886e38f;
+        int best_idx = (sid < 8) ? warp_min_idx[sid] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_down_sync(0xFFFFFFFFULL, best, offset);
+            int other_idx = __shfl_down_sync(0xFFFFFFFFULL, best_idx, offset);
+            if (other_cost < best) {
+                best = other_cost;
+                best_idx = other_idx;
+            }
         }
-        shared_initial_state = best_idx; // temporarily: best final state (becomes initial after backtrack)
+        if (sid == 0) {
+            shared_initial_state = best_idx;
+        }
     }
     __syncthreads();
 
@@ -1205,13 +1238,13 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     if (d_tcq_dump_max > 0 && grp < d_tcq_dump_max && sid < 128)
         d_tcq_dump_x_buf[grp * 128 + sid] = x[sid];
 
-    // Backtrack (inherently sequential, reads global bt)
+    // Backtrack (inherently sequential, reads compressed bt)
     uint8_t * outputs = (uint8_t *)x;
     if (sid == 0) {
         int state = shared_initial_state;
         for (int t = 127; t >= 0; t--) {
             outputs[t] = (uint8_t)(state >> 6);
-            int p = bt[t * 256 + state];
+            int p = bt[t * 64 + (state & 0x3F)];
             state = ((state & 0x3F) << 2) | p;
         }
         shared_initial_state = state;
@@ -1259,17 +1292,30 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
     corrected_norm *= iq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
 
-    // Serial bitpack — byte-alignment prevents parallel atomicOr
-    if (sid == 0) {
-        for (int j = 0; j < 33; j++) dst_blk->qs[j] = 0;
-        dst_blk->qs[0] = (uint8_t)((shared_initial_state >> 2) & 0x3F);
-        for (int t = 0; t < 128; t++) {
-            const int bit_pos = 6 + t * 2;
-            const int byte_idx = bit_pos / 8;
-            const int bit_off = bit_pos % 8;
-            const int out = outputs[t] & 0x3;
-            dst_blk->qs[byte_idx] |= (uint8_t)(out << bit_off);
+    // Parallel bitpack: qs stores 6 initial-state bits followed by 128 2-bit
+    // output symbols. Each byte is independent (2-bit symbols never cross byte
+    // boundaries after the 6-bit prefix), so avoid the serial OR loop.
+    if (sid < 33) {
+        const int init_bits = (shared_initial_state >> 2) & 0x3F;
+        uint8_t packed = 0;
+#pragma unroll
+        for (int bit = 0; bit < 8; bit++) {
+            const int pos = sid * 8 + bit;
+            int v = 0;
+            if (pos < 6) {
+                v = (init_bits >> pos) & 1;
+            } else {
+                const int sym_bit_pos = pos - 6;
+                const int sym_idx = sym_bit_pos / 2;
+                if (sym_idx < 128) {
+                    v = (outputs[sym_idx] >> (sym_bit_pos % 2)) & 1;
+                }
+            }
+            packed |= (uint8_t)(v << bit);
         }
+        dst_blk->qs[sid] = packed;
+    }
+    if (sid == 0) {
         dst_blk->norm = __float2half(corrected_norm);
     }
 }
