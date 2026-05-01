@@ -96,12 +96,13 @@ https://huggingface.co/unsloth/Qwen3.6-27B-GGUF
 → Qwen3.6-27B-Q4_K_M.gguf
 ```
 
-**Draft model** — two options:
+**Draft model** (Q8_0, 1.7GB):
+```
+https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF
+→ Qwen3.6-27B-DFlash-Q8_0.gguf
+```
 
-| Option | Size | Speed | Link |
-|--------|------|-------|------|
-| **Q8_0** (recommended) | 1.7GB | 40 tok/s | [spiritbuun/Qwen3.6-27B-DFlash-GGUF](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF) |
-| BF16 (direct) | 3.4GB | slightly faster | Convert from [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) |
+> BF16 draft is 2× larger and benchmarks ~2 tok/s slower — Q8_0 wins on GB10.
 
 ### 3. Launch Server
 
