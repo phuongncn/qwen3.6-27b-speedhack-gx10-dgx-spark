@@ -30,7 +30,7 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (400 tok) | 11.4 tok/s | **26.9 tok/s** | **~2.5×** |
+| HTML/JS coding (400 tok) | 11.4 tok/s | **30-35 tok/s** | **~3×** |
 | Short chat (150 tok) | 11.3 tok/s | **22.4 tok/s** | **~2×** |
 | Medium context (300 tok) | 11.4 tok/s | **19.0 tok/s** | **~1.5-2×** |
 | Sustained 2048 tok | 11.4 tok/s | **28.2 tok/s** | **~2.5×** |
@@ -41,7 +41,7 @@ Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash 
 
 | Scenario | Q4_K_M (16GB) | Q8_0 (27GB) | BF16 (51GB) |
 |----------|:-------------:|:-----------:|:-----------:|
-| HTML/JS coding (400 tok) | **26.9 tok/s** | 22.0 tok/s | 16.1 tok/s |
+| HTML/JS coding (400 tok) | **30-35 tok/s** | 22.0 tok/s | 16.1 tok/s |
 | Short chat (150 tok) | **22.4 tok/s** | 21.1 tok/s | 14.7 tok/s |
 | Medium context (300 tok) | **19.0 tok/s** | 13.5 tok/s | 8.6 tok/s |
 | Sustained 2048 tok | **28.2 tok/s** | 23.5 tok/s | 13.7 tok/s |
@@ -56,7 +56,7 @@ Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash 
 - **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
 - **Model size** — every 10GB of extra model weights costs ~5-7 tok/s on GB10.
 
-**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 27-32 tok/s web dev, 22-27 tok/s backend, 19-22 tok/s with context. Sustained 2048-token generations hold at ~28 tok/s.
+**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 30-35 tok/s HTML/JS, 22-27 tok/s backend, 19-22 tok/s with context. Sustained 2048-token generations hold at ~28 tok/s.
 
 ## What Makes This Fast
 
