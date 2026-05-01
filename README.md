@@ -30,10 +30,10 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (400 tok) | 11.4 tok/s | **26.9 tok/s** | **2.4×** |
-| Short chat (150 tok) | 11.3 tok/s | **22.4 tok/s** | **2.0×** |
-| Medium context (300 tok) | 11.4 tok/s | **19.0 tok/s** | **1.7×** |
-| Sustained 2048 tok | 11.4 tok/s | **28.2 tok/s** | **2.5×** |
+| HTML/JS coding (400 tok) | 11.4 tok/s | **26.9 tok/s** | **~2.5×** |
+| Short chat (150 tok) | 11.3 tok/s | **22.4 tok/s** | **~2×** |
+| Medium context (300 tok) | 11.4 tok/s | **19.0 tok/s** | **~1.5-2×** |
+| Sustained 2048 tok | 11.4 tok/s | **28.2 tok/s** | **~2.5×** |
 
 Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash adds 1.7-2.5× speedup depending on content type and context length.
 
