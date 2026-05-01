@@ -12,6 +12,8 @@ It started with a single number: **7 tok/s**.
 
 Running Qwen3.6 27B on the ASUS GX10 (NVIDIA DGX Spark / GB10 Grace-Blackwell) with stock llama.cpp. Tried everything — TurboQuant KV cache, CUDA graph optimizations, Flash Attention, tweaking batch sizes, thread pinning, every environment variable in the book. Best I got was ~10 tok/s on a good day. For a machine with 128GB unified memory and a Blackwell GPU, that felt wrong.
 
+Before that, I actually found **vLLM + MTP** first. It also hit around 30 tok/s — competitive numbers. But vLLM takes minutes to load the model, and the speed isn't stable — it surges and dips unpredictably. I've always loved llama.cpp for loading models in seconds and just getting to work. That fast startup matters when you're iterating, testing, rebooting, switching models. vLLM felt like waiting for a server to boot; llama.cpp felt like launching an app.
+
 Then I stumbled across **DFlash** — block-diffusion speculative decoding. A tiny 1.7GB draft model that generates *multiple tokens per forward pass*, verified in bulk by the target model. The spiritbuun fork had already done the heavy lifting: GPU cross-ring, tape replay, fused Gated Delta Net kernels.
 
 But the out-of-the-box numbers weren't great on long context. Acceptance rate would collapse to ~12% beyond 3K tokens. Draft tokens were being generated but mostly rejected — wasted compute.
@@ -20,13 +22,26 @@ But the out-of-the-box numbers weren't great on long context. Acceptance rate wo
 
 The result: **acceptance rate jumped from 39% to 67%**. Same hardware. Same models. Just smarter drafting.
 
-| Scenario | Before (stock) | After (optimized) |
-|----------|:-------------:|:-----------------:|
-| Code writing | 7–10 tok/s | **30–35 tok/s** |
-| Chat / Q&A | 7–10 tok/s | **15–25 tok/s** |
-| Draft acceptance rate | 39% | **55–67%** |
-| Draft time per cycle | 29ms | 30ms |
-| Verify time per cycle | 120ms | 135ms |
+## Benchmarks
+
+All tests on GB10 with Q4_K_M target (16GB) + Q8_0 draft (1.7GB), turbo4 KV cache, p_min=0.3.
+
+| Scenario | Prompt | Completion | Speed | Accept Rate |
+|----------|:------:|:----------:|:-----:|:-----------:|
+| HTML/JS coding | 41 tok | 400 tok | **31.7 tok/s** | 55–62% |
+| Python coding | 40 tok | 250 tok | **26.9 tok/s** | 55–62% |
+| Sustained generation | 82 tok | 2048 tok | **28.2 tok/s** | 60.6% |
+| Chat / Q&A | 26 tok | 150 tok | **22.4 tok/s** | 55–67% |
+| Medium context | 69 tok | 300 tok | **19.0 tok/s** | 55–62% |
+| Long context | 209 tok | 350 tok | **21.5 tok/s** | 52–63% |
+
+**What affects speed:**
+- **Content type** — HTML/JS/CSS drafts faster than Python (~32 vs ~27 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict, yielding higher acceptance.
+- **Prompt length** — longer context slightly reduces speed (more KV cache to process), but p_min keeps it stable.
+- **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
+- **Target model quantization** — Q4_K_M (16GB) is 18–29% faster than Q8_0 (27GB). Memory bandwidth is the bottleneck on GB10 (500 GB/s unified memory).
+
+**TL;DR:** 30-35 tok/s for web dev, 25-30 tok/s for backend code, 15-25 tok/s for chat. Sustained 2048-token generations hold at ~28 tok/s.
 
 ## What Makes This Fast
 
