@@ -1,6 +1,6 @@
-# Qwen3.6 27B × DFlash — 40 tok/s on NVIDIA DGX Spark (GB10)
+# Qwen3.6 27B × DFlash — 30-35 tok/s on NVIDIA DGX Spark (GB10)
 
-**Before: 7–10 tok/s. After: 40 tok/s. Nothing is impossible.**
+**Before: 7–10 tok/s. Now: 30-35 tok/s coding, 15-25 tok/s chat. Nothing is impossible.**
 
 <p align="center">
   <img src="buunslamma.png" alt="buun llama" width="200"/>
@@ -20,13 +20,13 @@ But the out-of-the-box numbers weren't great on long context. Acceptance rate wo
 
 The result: **acceptance rate jumped from 39% to 67%**. Same hardware. Same models. Just smarter drafting.
 
-| Metric | Before (stock) | After (optimized) |
-|--------|:-------------:|:-----------------:|
-| Short context (500 tok) | 7–10 tok/s | **40 tok/s** |
-| Long context (1K tok) | — | **25 tok/s** |
-| Draft acceptance rate | 39% | **67%** |
-| Draft time per cycle | 29ms | 30ms (unchanged) |
-| Verify time per cycle | 120ms | 135ms (larger context) |
+| Scenario | Before (stock) | After (optimized) |
+|----------|:-------------:|:-----------------:|
+| Code writing | 7–10 tok/s | **30–35 tok/s** |
+| Chat / Q&A | 7–10 tok/s | **15–25 tok/s** |
+| Draft acceptance rate | 39% | **55–67%** |
+| Draft time per cycle | 29ms | 30ms |
+| Verify time per cycle | 120ms | 135ms |
 
 ## What Makes This Fast
 
