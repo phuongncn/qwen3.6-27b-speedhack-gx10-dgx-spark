@@ -585,6 +585,11 @@ private:
     int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
     bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
 
+    // dynamic ubatch: prefill uses large ubatch for speed, decode uses small for DFlash efficiency
+    int32_t n_ubatch_prefill = 0;
+    int32_t n_ubatch_decode  = 64; // DFlash verify batch is ~17-25 tokens
+    int32_t n_ubatch_current  = 0;  // track current mode to avoid redundant switches
+
     int32_t n_ctx; // total context for all clients / slots
 
     // slots / clients
@@ -681,6 +686,10 @@ private:
 
         model = llama_init->model();
         ctx   = llama_init->context();
+
+        n_ubatch_prefill = llama_n_ubatch(ctx);
+        n_ubatch_current  = n_ubatch_prefill;
+        SRV_INF("dynamic ubatch: prefill=%d decode=%d\n", n_ubatch_prefill, n_ubatch_decode);
 
         if (model == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
@@ -2978,6 +2987,17 @@ private:
             && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH);
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx, false);
+            if (n_ubatch_current != n_ubatch_decode) {
+                SRV_INF("dynamic ubatch: switching %d -> %d (decode)\n", n_ubatch_current, n_ubatch_decode);
+                llama_set_n_ubatch(ctx, n_ubatch_decode);
+                n_ubatch_current = n_ubatch_decode;
+            }
+        } else if (batch.n_tokens > n_tg_tokens) {
+            if (n_ubatch_current != n_ubatch_prefill) {
+                SRV_INF("dynamic ubatch: switching %d -> %d (prefill)\n", n_ubatch_current, n_ubatch_prefill);
+                llama_set_n_ubatch(ctx, n_ubatch_prefill);
+                n_ubatch_current = n_ubatch_prefill;
+            }
         }
 
         // process the created batch of tokens
@@ -3246,8 +3266,7 @@ private:
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                        // DFlash: use tape replay for fast rollback (matches speculative-simple).
-                        // Route replay through this slot's tape.
+                        // DFlash: use GPU intermediates for fast SSM restore + conv from tape.
                         llama_dflash_set_active_slot(ctx, slot.id);
                         if (all_accepted) {
                             llama_clear_tree_parent_ids(ctx);
@@ -3255,8 +3274,20 @@ private:
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
                             llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
                         } else {
-                            llama_clear_tree_parent_ids(ctx);
-                            llama_dflash_rollback(ctx, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
+                            const int n_batch_tokens = 1 + (int)n_draft;
+                            std::vector<int32_t> linear_parents(n_batch_tokens);
+                            linear_parents[0] = -1;
+                            for (int i = 1; i < n_batch_tokens; i++) {
+                                linear_parents[i] = i - 1;
+                            }
+                            const int commit_n = (int)ids.size() - 1;
+                            const int n_past_before = slot.n_tokens_before_draft;
+                            llama_tree_rollback(ctx, commit_n, linear_parents.data(), n_past_before + commit_n);
+
+                            // Flat mode: trim rejected KV tail
+                            auto * mem = llama_get_memory(ctx);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
                         }
                     } else {
                         // Generic: backup-restore + re-decode for other speculative types

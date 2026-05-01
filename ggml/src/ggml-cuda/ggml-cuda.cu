@@ -3458,6 +3458,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    // Clear any stale CUDA error from previous async operations (e.g. draft model)
+    (void)cudaGetLastError();
+
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu

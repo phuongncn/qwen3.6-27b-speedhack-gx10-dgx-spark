@@ -309,6 +309,14 @@ int main(int argc, char ** argv) {
     while (true) {
         n_iters++;
 
+        // Dynamic draft-max: cap at longer context, respects user --spec-draft-n-max
+        {
+            int dyn_n = params.speculative.n_max;
+            if      (n_past > 4096) dyn_n = std::min(dyn_n, 4);
+            else if (n_past > 3072) dyn_n = std::min(dyn_n, 8);
+            params.speculative.n_max = dyn_n;
+        }
+
         llama_tokens ids;
         int n_draft_this_iter = 0;
         int main_path_len = 0;
@@ -604,7 +612,7 @@ int main(int argc, char ** argv) {
                 }
                 n_past = (int)prompt_tgt.size();
             } else {
-                // Flat path rollback: tree_rollback (GPU intermediates) for SSM + conv state
+                // Flat path rollback: tree_rollback for SSM (GPU intermediates) + tail trim for KV
                 const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
 
                 if (all_accepted) {
@@ -615,13 +623,18 @@ int main(int argc, char ** argv) {
                     n_reeval_skipped++;
                 } else {
                     const int n_past_before = n_past - (int)ids.size();
-
-                    llama_clear_tree_parent_ids(ctx_tgt);
+                    const int commit_n = (int)ids.size() - 1; // last accepted node in parent_ids
+                    auto * mem = llama_get_memory(ctx_tgt);
 
                     {
                         common_time_meas tm(t_decode2_total);
-                        llama_dflash_rollback(ctx_tgt, 0, seq_backup, n_past_before, (int)ids.size());
+                        // Restore SSM state from GPU intermediates + conv from tape
+                        llama_tree_rollback(ctx_tgt, commit_n, linear_parents.data(), n_past_before + commit_n);
                     }
+
+                    // Flat mode: no branch collisions, just trim rejected KV tail
+                    llama_memory_seq_rm(mem, 0, n_past, -1);
+                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
 
                     n_reeval_tokens += (int)ids.size();
                     n_reeval_calls++;

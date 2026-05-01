@@ -197,6 +197,7 @@ struct llama_context {
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
+    void     set_n_ubatch(uint32_t n);
     uint32_t n_seq_max() const;
 
     uint32_t n_threads()       const;

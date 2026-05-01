@@ -717,6 +717,11 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+void llama_context::set_n_ubatch(uint32_t n) {
+    cparams.n_ubatch = n;
+    sched_need_reserve = true; // force scheduler re-reserve with new ubatch size
+}
+
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
@@ -4631,6 +4636,10 @@ void llama_set_force_split_seq(llama_context * ctx, bool force) {
     if (mem) {
         mem->set_force_split_seq(force);
     }
+}
+
+void llama_set_n_ubatch(llama_context * ctx, uint32_t n_ubatch) {
+    ctx->set_n_ubatch(n_ubatch);
 }
 
 void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {

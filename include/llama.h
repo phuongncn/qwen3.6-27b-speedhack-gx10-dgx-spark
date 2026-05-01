@@ -1094,6 +1094,11 @@ extern "C" {
     // a verify-only decode, and true after (mixed prompt+TG batches need split_seq).
     LLAMA_API void llama_set_force_split_seq(struct llama_context * ctx, bool force);
 
+    // Set micro-batch size at runtime. Safe to call before llama_decode() to use
+    // different ubatch for prefill (large) vs decode (small). Start with the large
+    // value at init so scratch buffers are sized for worst case.
+    LLAMA_API void llama_set_n_ubatch(struct llama_context * ctx, uint32_t n_ubatch);
+
     // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
     // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
     // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.

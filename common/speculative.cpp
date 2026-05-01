@@ -439,13 +439,13 @@ struct common_speculative_state_draft : public common_speculative_state {
             common_sampler_accept(smpl, id, true);
 
             // only collect very high-confidence draft tokens
-            if (cur_p->data[0].p < sparams.p_min) {
+            if (cur_p->data[0].p < params.p_min) {
                 break;
             }
 
             result.push_back(id);
 
-            if (sparams.n_max <= (int) result.size()) {
+            if (params.n_max <= (int) result.size()) {
                 break;
             }
 
