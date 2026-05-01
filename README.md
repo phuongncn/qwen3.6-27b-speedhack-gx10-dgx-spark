@@ -30,21 +30,21 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (400 tok) | 11.4 tok/s | **30-35 tok/s** | **~3×** |
-| Short chat (150 tok) | 11.3 tok/s | **22.4 tok/s** | **~2×** |
-| Medium context (300 tok) | 11.4 tok/s | **19.0 tok/s** | **~1.5-2×** |
-| Sustained 2048 tok | 11.4 tok/s | **28.2 tok/s** | **~2.5×** |
+| HTML/JS coding (400 tok) | ~11 tok/s | **30-35 tok/s** | **~3×** |
+| Short chat (150 tok) | ~11 tok/s | **~22 tok/s** | **~2×** |
+| Medium context (300 tok) | ~11 tok/s | **~19 tok/s** | **~1.5-2×** |
+| Sustained 2048 tok | ~11 tok/s | **~28 tok/s** | **~2.5×** |
 
-Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash adds 1.7-2.5× speedup depending on content type and context length.
+Stock llama.cpp is a consistent ~11 tok/s regardless of scenario. DFlash adds 1.5-3× speedup depending on content type and context length.
 
 ### Target Model Quantization Comparison (all with DFlash + Q8_0 draft)
 
 | Scenario | Q4_K_M (16GB) | Q8_0 (27GB) | BF16 (51GB) |
 |----------|:-------------:|:-----------:|:-----------:|
-| HTML/JS coding (400 tok) | **30-35 tok/s** | 22.0 tok/s | 16.1 tok/s |
-| Short chat (150 tok) | **22.4 tok/s** | 21.1 tok/s | 14.7 tok/s |
-| Medium context (300 tok) | **19.0 tok/s** | 13.5 tok/s | 8.6 tok/s |
-| Sustained 2048 tok | **28.2 tok/s** | 23.5 tok/s | 13.7 tok/s |
+| HTML/JS coding (400 tok) | **30-35 tok/s** | ~22 tok/s | ~16 tok/s |
+| Short chat (150 tok) | **~22 tok/s** | ~21 tok/s | ~15 tok/s |
+| Medium context (300 tok) | **~19 tok/s** | ~14 tok/s | ~9 tok/s |
+| Sustained 2048 tok | **~28 tok/s** | ~24 tok/s | ~14 tok/s |
 | Accept rate | 55–62% | 52–71% | 59% |
 
 **Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 500 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
