@@ -1,6 +1,6 @@
-# Qwen3.6 27B × DFlash — 40 tok/s on NVIDIA DGX Spark (GB10)
+# Qwen3.6 × DFlash — Up to 140 tok/s on NVIDIA DGX Spark (GB10)
 
-**Before: 7–11 tok/s. Now: 38-40 tok/s coding, 23-25 tok/s chat. Nothing is impossible.**
+**27B dense: 7–11 tok/s → 38-40 tok/s coding. 35B MoE: 60-66 tok/s → 100-140 tok/s. Nothing is impossible.**
 
 <p align="center">
   <img src="buunslamma.png" alt="buun llama" width="200"/>
@@ -26,7 +26,22 @@ The result: **acceptance rate jumped from 39% to 67%**. Same hardware. Same mode
 
 All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 KV cache, DFlash uses turbo4.
 
-### DFlash vs Stock (Q4_K_M target, 16GB)
+### Qwen3.6-35B-A3B (MoE) — DFlash vs Stock
+
+Stock llama.cpp runs the full 35B model at ~60-66 tok/s regardless of content. DFlash (n_max=14, p_min=0.3) roughly doubles throughput:
+
+| Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
+|----------|:-----------------:|:------------------:|:-------:|
+| HTML/JS coding (400 tok) | 60-66 tok/s | **130-145 tok/s** | **~2.2×** |
+| Python coding (400-500 tok) | 60-66 tok/s | **96-119 tok/s** | **~1.8×** |
+| Short chat (150 tok) | 60-66 tok/s | **52-56 tok/s** | ~0.9× |
+| Sustained 1024 tok | 60-66 tok/s | **70-93 tok/s** | **~1.4×** |
+
+The 35B-A3B is a Mixture-of-Experts model — only ~3B parameters activate per token. This gives much lower memory bandwidth per verify step (29ms vs 42ms for dense 27B), letting DFlash scale further. For sustained/batch workloads use n_max=20 to hit **172 tok/s**.
+
+> Note: chat speed appears lower because 35B at 60+ tok/s stock is already near the DFlash verify ceiling for short sequences.
+
+### Qwen3.6-27B (Dense) — DFlash vs Stock (Q4_K_M target, 16GB)
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
@@ -56,7 +71,7 @@ Stock llama.cpp is a consistent 7-11 tok/s regardless of scenario. DFlash adds 2
 - **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
 - **Model size** — every 10GB of extra model weights costs ~5-7 tok/s on GB10.
 
-**TL;DR:** Q4_K_M target + Q8_0 draft + `--spec-draft-n-max 14` = best combination. 38-40 tok/s HTML/JS, 23-25 tok/s chat, 20-22 tok/s with context. Sustained 2048-token generations hold at 27-29 tok/s.
+**TL;DR:** Q4_K_M target + Q8_0 draft + `--spec-draft-n-max 14` = best combination for 27B. 38-40 tok/s HTML/JS, 23-25 tok/s chat. For 35B-A3B MoE: same flags give 100-140 tok/s coding (2× stock), or use n_max=20 for 172 tok/s sustained.
 
 ## What Makes This Fast
 
@@ -90,6 +105,8 @@ cmake --build . -j20 --config Release
 
 ### 2. Download Models
 
+#### Qwen3.6-27B (Dense) — 16GB, best for long context
+
 **Target model** (Q4_K_M, 16GB):
 ```
 https://huggingface.co/unsloth/Qwen3.6-27B-GGUF
@@ -102,9 +119,23 @@ https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF
 → Qwen3.6-27B-DFlash-Q8_0.gguf
 ```
 
-> BF16 draft is 2× larger and benchmarks ~2 tok/s slower — Q8_0 wins on GB10.
+#### Qwen3.6-35B-A3B (MoE) — 21GB, 2× faster than stock 60-66 tok/s
+
+**Target model** (Q4_K_M, 21GB):
+```
+https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
+→ Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+```
+
+**Draft model** (914MB):
+```
+https://huggingface.co/spiritbuun/Qwen3.6-35B-A3B-DFlash-GGUF
+→ Qwen3.6-35B-A3B-DFlash-Q8_0.gguf
+```
 
 ### 3. Launch Server
+
+#### Qwen3.6-27B (38-40 tok/s coding)
 
 ```bash
 ./build/bin/llama-server \
@@ -117,7 +148,30 @@ https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF
   --spec-draft-n-min 0 \
   --draft-max 14 \
   -ngl 99 -ngld 99 \
-  -c 8192 -cd 256 \
+  -c 256000 -cd 256 \
+  -b 2048 -ub 1024 \
+  -ctk turbo4 -ctv turbo4 \
+  -fa 1 \
+  --host 0.0.0.0 --port 8080 \
+  --jinja \
+  --reasoning off \
+  --cache-ram 0
+```
+
+#### Qwen3.6-35B-A3B (100-140 tok/s coding)
+
+```bash
+./build/bin/llama-server \
+  -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+  -md Qwen3.6-35B-A3B-DFlash-Q8_0.gguf \
+  --spec-type dflash \
+  --spec-dflash-default \
+  --spec-draft-p-min 0.3 \
+  --spec-draft-n-max 14 \
+  --spec-draft-n-min 0 \
+  --draft-max 14 \
+  -ngl 99 -ngld 99 \
+  -c 256000 -cd 256 \
   -b 2048 -ub 1024 \
   -ctk turbo4 -ctv turbo4 \
   -fa 1 \
@@ -143,9 +197,9 @@ OpenAI-compatible API — works with any client (Open WebUI, Continue.dev, RooCo
 |------|-------|---------------|
 | `--spec-dflash-default` | — | Enables DFlash optimized defaults |
 | `--spec-draft-p-min` | 0.3 | Stop drafting when confidence < 0.3 (doubles accept rate) |
-| `--spec-draft-n-max` | 8 | Max draft tokens, auto-reduces at long context |
+| `--spec-draft-n-max` | 14 | Max draft tokens, auto-reduces at long context |
 | `--spec-draft-n-min` | 0 | Minimum draft tokens (0 = fully adaptive) |
-| `--draft-max` | 8 | Max tokens per draft forward pass |
+| `--draft-max` | 14 | Max tokens per draft forward pass |
 | `-ctk` / `-ctv` | turbo4 | TurboQuant scalar KV cache (3.8× compression) |
 | `-cd` | 256 | Draft model context (small = fast, drafter only sees recent tokens) |
 
