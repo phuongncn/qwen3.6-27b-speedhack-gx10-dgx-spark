@@ -46,6 +46,7 @@ The 35B-A3B is a Mixture-of-Experts model — only ~3B parameters activate per t
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
 | HTML/JS coding (400 tok) | 7-11 tok/s | **38-40 tok/s** | **~4×** |
+| Python coding (400-500 tok) | 7-11 tok/s | **24-25 tok/s** | **~2.5×** |
 | Short chat (150 tok) | 7-11 tok/s | **23-25 tok/s** | **~2.5×** |
 | Medium context (300 tok) | 7-11 tok/s | **20-22 tok/s** | **~2×** |
 | Sustained 2048 tok | 7-11 tok/s | **27-29 tok/s** | **~2.5×** |
