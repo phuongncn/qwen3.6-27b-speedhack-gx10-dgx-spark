@@ -1,6 +1,6 @@
-# Qwen3.6 27B × DFlash — 30-35 tok/s on NVIDIA DGX Spark (GB10)
+# Qwen3.6 27B × DFlash — 40 tok/s on NVIDIA DGX Spark (GB10)
 
-**Before: 7–11 tok/s. Now: 30-35 tok/s coding, 15-25 tok/s chat. Nothing is impossible.**
+**Before: 7–11 tok/s. Now: 38-40 tok/s coding, 23-25 tok/s chat. Nothing is impossible.**
 
 <p align="center">
   <img src="buunslamma.png" alt="buun llama" width="200"/>
@@ -30,33 +30,33 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (400 tok) | 7-11 tok/s | **30-35 tok/s** | **~3×** |
-| Short chat (150 tok) | 7-11 tok/s | **21-23 tok/s** | **~2×** |
-| Medium context (300 tok) | 7-11 tok/s | **18-20 tok/s** | **~1.5-2×** |
+| HTML/JS coding (400 tok) | 7-11 tok/s | **38-40 tok/s** | **~4×** |
+| Short chat (150 tok) | 7-11 tok/s | **23-25 tok/s** | **~2.5×** |
+| Medium context (300 tok) | 7-11 tok/s | **20-22 tok/s** | **~2×** |
 | Sustained 2048 tok | 7-11 tok/s | **27-29 tok/s** | **~2.5×** |
 
-Stock llama.cpp is a consistent 7-11 tok/s regardless of scenario. DFlash adds 1.5-3× speedup depending on content type and context length.
+Stock llama.cpp is a consistent 7-11 tok/s regardless of scenario. DFlash adds 2-4× speedup depending on content type and context length.
 
 ### Target Model Quantization Comparison (all with DFlash + Q8_0 draft)
 
 | Scenario | Q4_K_M (16GB) | Q8_0 (27GB) | BF16 (51GB) |
 |----------|:-------------:|:-----------:|:-----------:|
-| HTML/JS coding (400 tok) | **30-35 tok/s** | 21-23 tok/s | 15-17 tok/s |
-| Short chat (150 tok) | **21-23 tok/s** | 20-22 tok/s | 14-16 tok/s |
-| Medium context (300 tok) | **18-20 tok/s** | 13-15 tok/s | 8-10 tok/s |
+| HTML/JS coding (400 tok) | **38-40 tok/s** | 21-23 tok/s | 15-17 tok/s |
+| Short chat (150 tok) | **23-25 tok/s** | 20-22 tok/s | 14-16 tok/s |
+| Medium context (300 tok) | **20-22 tok/s** | 13-15 tok/s | 8-10 tok/s |
 | Sustained 2048 tok | **27-29 tok/s** | 23-25 tok/s | 13-15 tok/s |
-| Accept rate | 55–62% | 52–71% | 59% |
+| Accept rate | 52–61% | 52–71% | 59% |
 
 **Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 273 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
 
 ### What Affects Speed
 
-- **Content type** — HTML/JS/CSS drafts faster than Python (30-35 vs 22-27 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict.
+- **Content type** — HTML/JS/CSS drafts faster than Python (38-40 vs 23-25 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict.
 - **Prompt length** — longer context slightly reduces speed but p_min keeps acceptance rate stable.
 - **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
 - **Model size** — every 10GB of extra model weights costs ~5-7 tok/s on GB10.
 
-**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 30-35 tok/s HTML/JS, 22-27 tok/s backend, 18-20 tok/s with context. Sustained 2048-token generations hold at 27-29 tok/s.
+**TL;DR:** Q4_K_M target + Q8_0 draft + `--spec-draft-n-max 14` = best combination. 38-40 tok/s HTML/JS, 23-25 tok/s chat, 20-22 tok/s with context. Sustained 2048-token generations hold at 27-29 tok/s.
 
 ## What Makes This Fast
 
@@ -113,9 +113,9 @@ https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF
   --spec-type dflash \
   --spec-dflash-default \
   --spec-draft-p-min 0.3 \
-  --spec-draft-n-max 8 \
+  --spec-draft-n-max 14 \
   --spec-draft-n-min 0 \
-  --draft-max 8 \
+  --draft-max 14 \
   -ngl 99 -ngld 99 \
   -c 8192 -cd 256 \
   -b 2048 -ub 1024 \
