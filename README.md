@@ -24,24 +24,39 @@ The result: **acceptance rate jumped from 39% to 67%**. Same hardware. Same mode
 
 ## Benchmarks
 
-All tests on GB10 with Q4_K_M target (16GB) + Q8_0 draft (1.7GB), turbo4 KV cache, p_min=0.3.
+All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 KV cache, DFlash uses turbo4.
 
-| Scenario | Prompt | Completion | Speed | Accept Rate |
-|----------|:------:|:----------:|:-----:|:-----------:|
-| HTML/JS coding | 41 tok | 400 tok | **31.7 tok/s** | 55–62% |
-| Python coding | 40 tok | 250 tok | **26.9 tok/s** | 55–62% |
-| Sustained generation | 82 tok | 2048 tok | **28.2 tok/s** | 60.6% |
-| Chat / Q&A | 26 tok | 150 tok | **22.4 tok/s** | 55–67% |
-| Medium context | 69 tok | 300 tok | **19.0 tok/s** | 55–62% |
-| Long context | 209 tok | 350 tok | **21.5 tok/s** | 52–63% |
+### DFlash vs Stock (Q4_K_M target, 16GB)
 
-**What affects speed:**
-- **Content type** — HTML/JS/CSS drafts faster than Python (~32 vs ~27 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict, yielding higher acceptance.
-- **Prompt length** — longer context slightly reduces speed (more KV cache to process), but p_min keeps it stable.
+| Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
+|----------|:-----------------:|:------------------:|:-------:|
+| HTML/JS coding (400 tok) | 11.4 tok/s | **26.9 tok/s** | **2.4×** |
+| Short chat (150 tok) | 11.3 tok/s | **22.4 tok/s** | **2.0×** |
+| Medium context (300 tok) | 11.4 tok/s | **19.0 tok/s** | **1.7×** |
+| Sustained 2048 tok | 11.4 tok/s | **28.2 tok/s** | **2.5×** |
+
+Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash adds 1.7-2.5× speedup depending on content type and context length.
+
+### Target Model Quantization Comparison (all with DFlash + Q8_0 draft)
+
+| Scenario | Q4_K_M (16GB) | Q8_0 (27GB) | BF16 (51GB) |
+|----------|:-------------:|:-----------:|:-----------:|
+| HTML/JS coding (400 tok) | **26.9 tok/s** | 22.0 tok/s | 16.1 tok/s |
+| Short chat (150 tok) | **22.4 tok/s** | 21.1 tok/s | 14.7 tok/s |
+| Medium context (300 tok) | **19.0 tok/s** | 13.5 tok/s | 8.6 tok/s |
+| Sustained 2048 tok | **28.2 tok/s** | — | 13.7 tok/s |
+| Accept rate | 55–62% | 52–71% | 59% |
+
+**Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 500 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
+
+### What Affects Speed
+
+- **Content type** — HTML/JS/CSS drafts faster than Python (~27 vs ~22 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict.
+- **Prompt length** — longer context slightly reduces speed but p_min keeps acceptance rate stable.
 - **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
-- **Target model quantization** — Q4_K_M (16GB) is 18–29% faster than Q8_0 (27GB). Memory bandwidth is the bottleneck on GB10 (500 GB/s unified memory).
+- **Model size** — every 10GB of extra model weights costs ~5-7 tok/s on GB10.
 
-**TL;DR:** 30-35 tok/s for web dev, 25-30 tok/s for backend code, 15-25 tok/s for chat. Sustained 2048-token generations hold at ~28 tok/s.
+**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 27-32 tok/s web dev, 22-27 tok/s backend, 19-22 tok/s with context. Sustained 2048-token generations hold at ~28 tok/s.
 
 ## What Makes This Fast
 
