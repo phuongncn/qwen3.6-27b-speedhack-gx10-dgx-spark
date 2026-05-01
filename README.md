@@ -44,7 +44,7 @@ Stock llama.cpp is a consistent ~11.3-11.4 tok/s regardless of scenario. DFlash 
 | HTML/JS coding (400 tok) | **26.9 tok/s** | 22.0 tok/s | 16.1 tok/s |
 | Short chat (150 tok) | **22.4 tok/s** | 21.1 tok/s | 14.7 tok/s |
 | Medium context (300 tok) | **19.0 tok/s** | 13.5 tok/s | 8.6 tok/s |
-| Sustained 2048 tok | **28.2 tok/s** | — | 13.7 tok/s |
+| Sustained 2048 tok | **28.2 tok/s** | 23.5 tok/s | 13.7 tok/s |
 | Accept rate | 55–62% | 52–71% | 59% |
 
 **Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 500 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
