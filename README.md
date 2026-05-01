@@ -1,6 +1,6 @@
 # Qwen3.6 27B × DFlash — 30-35 tok/s on NVIDIA DGX Spark (GB10)
 
-**Before: 7–10 tok/s. Now: 30-35 tok/s coding, 15-25 tok/s chat. Nothing is impossible.**
+**Before: 7–11 tok/s. Now: 30-35 tok/s coding, 15-25 tok/s chat. Nothing is impossible.**
 
 <p align="center">
   <img src="buunslamma.png" alt="buun llama" width="200"/>
