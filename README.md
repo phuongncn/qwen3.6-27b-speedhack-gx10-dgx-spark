@@ -30,33 +30,33 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (400 tok) | ~11 tok/s | **30-35 tok/s** | **~3×** |
-| Short chat (150 tok) | ~11 tok/s | **~22 tok/s** | **~2×** |
-| Medium context (300 tok) | ~11 tok/s | **~19 tok/s** | **~1.5-2×** |
-| Sustained 2048 tok | ~11 tok/s | **~28 tok/s** | **~2.5×** |
+| HTML/JS coding (400 tok) | 10-11 tok/s | **30-35 tok/s** | **~3×** |
+| Short chat (150 tok) | 10-11 tok/s | **21-23 tok/s** | **~2×** |
+| Medium context (300 tok) | 10-11 tok/s | **18-20 tok/s** | **~1.5-2×** |
+| Sustained 2048 tok | 10-11 tok/s | **27-29 tok/s** | **~2.5×** |
 
-Stock llama.cpp is a consistent ~11 tok/s regardless of scenario. DFlash adds 1.5-3× speedup depending on content type and context length.
+Stock llama.cpp is a consistent 10-11 tok/s regardless of scenario. DFlash adds 1.5-3× speedup depending on content type and context length.
 
 ### Target Model Quantization Comparison (all with DFlash + Q8_0 draft)
 
 | Scenario | Q4_K_M (16GB) | Q8_0 (27GB) | BF16 (51GB) |
 |----------|:-------------:|:-----------:|:-----------:|
-| HTML/JS coding (400 tok) | **30-35 tok/s** | ~22 tok/s | ~16 tok/s |
-| Short chat (150 tok) | **~22 tok/s** | ~21 tok/s | ~15 tok/s |
-| Medium context (300 tok) | **~19 tok/s** | ~14 tok/s | ~9 tok/s |
-| Sustained 2048 tok | **~28 tok/s** | ~24 tok/s | ~14 tok/s |
+| HTML/JS coding (400 tok) | **30-35 tok/s** | 21-23 tok/s | 15-17 tok/s |
+| Short chat (150 tok) | **21-23 tok/s** | 20-22 tok/s | 14-16 tok/s |
+| Medium context (300 tok) | **18-20 tok/s** | 13-15 tok/s | 8-10 tok/s |
+| Sustained 2048 tok | **27-29 tok/s** | 23-25 tok/s | 13-15 tok/s |
 | Accept rate | 55–62% | 52–71% | 59% |
 
-**Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 500 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
+**Q4_K_M is the clear winner** — 18-29% faster than Q8_0, ~2× faster than BF16. GB10's 273 GB/s unified memory bandwidth is the bottleneck: larger models spend more time reading weights per token. Q4_K_M quality is near-lossless for all practical use.
 
 ### What Affects Speed
 
-- **Content type** — HTML/JS/CSS drafts faster than Python (~27 vs ~22 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict.
+- **Content type** — HTML/JS/CSS drafts faster than Python (30-35 vs 22-27 tok/s). Boilerplate patterns (tags, brackets, repeated structures) are easier for the draft model to predict.
 - **Prompt length** — longer context slightly reduces speed but p_min keeps acceptance rate stable.
 - **Temperature** — negligible impact (temp=0.0 vs 0.7: within 1-2 tok/s).
 - **Model size** — every 10GB of extra model weights costs ~5-7 tok/s on GB10.
 
-**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 30-35 tok/s HTML/JS, 22-27 tok/s backend, 19-22 tok/s with context. Sustained 2048-token generations hold at ~28 tok/s.
+**TL;DR:** Q4_K_M target + Q8_0 draft = best combination. 30-35 tok/s HTML/JS, 22-27 tok/s backend, 18-20 tok/s with context. Sustained 2048-token generations hold at 27-29 tok/s.
 
 ## What Makes This Fast
 
@@ -72,7 +72,7 @@ Stock llama.cpp is a consistent ~11 tok/s regardless of scenario. DFlash adds 1.
 
 Tested on **NVIDIA DGX Spark (ASUS GX10)**:
 - Grace-Blackwell GB10 superchip
-- 128GB unified memory (LPDDR5X, 500 GB/s)
+- 128GB unified memory (LPDDR5X, 273 GB/s)
 - Blackwell GPU: SM 12.1, 99KB shared memory per block
 - Ubuntu 24.04, CUDA 13.0
 
