@@ -1247,6 +1247,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // GPU cross-attention ring (nullptr = CPU fallback)
     void * gpu_ring_handle = nullptr;
 
+    // Adaptive draft length tracking
+    int n_low_accept = 0;
+    int n_draft_last = 0;
+    int adaptive_n_draft = -1; // -1 = use default
+
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
         if (gpu_ring_handle) {
@@ -1474,7 +1479,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
             std::vector<float> * draft_log_probs = nullptr) override {
         GGML_UNUSED(prompt_tgt);
 
-        const int n_draft = std::min(block_size - 1, params.n_max);
+        const int n_draft_base = adaptive_n_draft > 0 ? adaptive_n_draft : (block_size - 1);
+        const int n_draft = std::min(n_draft_base, params.n_max);
         if (committed_len == 0) {
             return;
         }
@@ -1514,6 +1520,15 @@ struct common_speculative_state_dflash : public common_speculative_state {
             if (argmax) {
                 // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
                 for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+                    if (argmax_probs && params.p_min > 0.0f && i > 1) {
+                        float log_prob = argmax_probs[i * K_flat];
+                        float log_p_min = logf(params.p_min);
+                        if (log_prob < log_p_min) {
+                            LOG_DBG("dflash: early stop at position %d/%d (prob %.3f < p_min %.3f)\n",
+                                    i, batch_len, expf(log_prob), params.p_min);
+                            break;
+                        }
+                    }
                     result.push_back((llama_token) argmax[i * K_flat]);
                     if (draft_log_probs && argmax_probs) {
                         draft_log_probs->push_back(argmax_probs[i * K_flat]);
@@ -1538,13 +1553,32 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t4 = ggml_time_us();
 
+        n_draft_last = (int) result.size();
+
         LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
                 committed_len,
                 (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
     }
 
     void accept(uint16_t n_accepted) override {
-        GGML_UNUSED(n_accepted);
+        if (n_draft_last > 0) {
+            float f_acc = (float) n_accepted / (float) n_draft_last;
+            if (f_acc < 0.3f) {
+                n_low_accept++;
+                if (n_low_accept >= 3) {
+                    int base = adaptive_n_draft > 0 ? adaptive_n_draft : (block_size - 1);
+                    adaptive_n_draft = std::max(1, base / 2);
+                    LOG_DBG("dflash: low acceptance streak (%d) — reducing draft to %d\n",
+                            n_low_accept, adaptive_n_draft);
+                    n_low_accept = 0;
+                }
+            } else {
+                n_low_accept = 0;
+                if (f_acc > 0.6f && adaptive_n_draft > 0) {
+                    adaptive_n_draft = std::min(block_size - 1, adaptive_n_draft + 1);
+                }
+            }
+        }
     }
 
     void draft_tree(
@@ -2334,8 +2368,9 @@ void common_speculative_draft_batch(
     const int64_t t2 = ggml_time_us();
 
     // read per-spec argmax results
-    int32_t * argmax  = llama_get_logits_argmax(ctx_dft);
-    const int K_flat  = llama_get_logits_argmax_k(ctx_dft);
+    int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
+    float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+    const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
 
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
@@ -2344,6 +2379,12 @@ void common_speculative_draft_batch(
 
         if (argmax) {
             for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+                if (argmax_probs && params.p_min > 0.0f && i > 1) {
+                    float log_prob = argmax_probs[(offset + i) * K_flat];
+                    if (log_prob < logf(params.p_min)) {
+                        break;
+                    }
+                }
                 result.push_back((llama_token) argmax[(offset + i) * K_flat]);
             }
         } else {
@@ -2358,8 +2399,10 @@ void common_speculative_draft_batch(
             }
         }
 
-        // update stats
+        // update stats + adaptive draft tracking
         rs.impl->n_call_draft++;
+        auto * dfl = static_cast<common_speculative_state_dflash *>(rs.impl);
+        dfl->n_draft_last = (int) result.size();
         if (!result.empty()) {
             rs.impl->n_gen_drafts++;
             rs.impl->n_gen_tokens += result.size();

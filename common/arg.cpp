@@ -3524,6 +3524,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CTX_SIZE_DRAFT"));
     add_opt(common_arg(
         {"-devd", "--device-draft"}, "<dev1,dev2,..>",
+        string_format("device to use for the draft model (default: %s)", params.device_draft.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.device_draft = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DEVICE_DRAFT"));
+    add_opt(common_arg(
+        {"--spec-draft-n-max"}, "N",
+        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min"}, "N",
+        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+
+    add_opt(common_arg(
+        {"--spec-draft-p-split", "--draft-p-split"}, "P",
+        string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_split = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min", "--draft-p-min"}, "P",
+        string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_min = std::stof(value);
+            params.speculative.p_min       = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-ctx-size", "-cd", "--ctx-size-draft"}, "N",
+        string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.draft.n_ctx),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX_SIZE"));
+    add_opt(common_arg(
+        {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
@@ -3957,6 +4001,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_jinja = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-default"},
+        string_format("enable default speculative decoding config"),
+        [](common_params & params) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            params.speculative.ngram_mod.n_match = 24;
+            params.speculative.ngram_mod.n_min = 48;
+            params.speculative.ngram_mod.n_max = 64;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-dflash-default"},
+        string_format("enable default DFlash speculative decoding config (requires -md)"),
+        [](common_params & params) {
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+            params.speculative.p_min = 0.0f;
+            params.speculative.n_max = 7;
+            params.speculative.n_min = 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));
 
     return ctx_arg;
 }
