@@ -259,6 +259,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    cb(qkv_mixed, "qkv_mixed_pretranspose", il);  // tape captures contiguous [conv_channels, n_tokens]
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
