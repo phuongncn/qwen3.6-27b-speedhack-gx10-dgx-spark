@@ -159,7 +159,25 @@ The 35B-A3B is a hybrid SSM+Attention model. A one-line fix to the SSM conv stat
 
 **Target model:** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
 
-**Draft model:** No pre-built GGUF available. Convert from [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) safetensors using `convert_hf_to_gguf.py` from this repo.
+**Draft model:** No pre-built GGUF — convert from [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) safetensors:
+
+```bash
+# 1. Download the z-lab draft model (safetensors + config)
+huggingface-cli download z-lab/Qwen3.6-35B-A3B-DFlash \
+  --local-dir /path/to/Qwen3.6-35B-A3B-DFlash
+
+# 2. Copy tokenizer files from the original Qwen repo (z-lab doesn't ship them)
+huggingface-cli download Qwen/Qwen3.6-35B-A3B \
+  tokenizer.json tokenizer_config.json \
+  --local-dir /path/to/Qwen3.6-35B-A3B-DFlash
+
+# 3. Install dependencies and convert to BF16 GGUF
+pip install gguf sentencepiece
+python3 convert_hf_to_gguf.py \
+  /path/to/Qwen3.6-35B-A3B-DFlash \
+  --outtype bf16 \
+  --outfile Qwen3.6-35B-A3B-DFlash-BF16.gguf
+```
 
 ## Credits
 
