@@ -28,6 +28,8 @@ All tests on GB10, identical prompts, temperature=0.0 (greedy). Stock uses q8_0 
 
 ### Qwen3.6-35B-A3B (MoE) — DFlash vs Stock
 
+> **⚠️ Work in Progress:** The speed numbers below are real, but output quality with DFlash on 35B-A3B is currently unreliable. The 35B-A3B is a hybrid SSM+Attention model — the hidden state capture for cross-attention in the DFlash draft does not yet correctly handle SSM layers, which can cause corrupted tokens in generation. **For production use, run 35B without DFlash (60-66 tok/s, clean output).** A fix is being investigated.
+
 Stock llama.cpp runs the full 35B model at ~60-66 tok/s regardless of content. DFlash (n_max=14, p_min=0.3) roughly doubles throughput:
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
@@ -120,7 +122,7 @@ https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF
 → Qwen3.6-27B-DFlash-Q8_0.gguf
 ```
 
-#### Qwen3.6-35B-A3B (MoE) — 21GB, 2× faster than stock 60-66 tok/s
+#### Qwen3.6-35B-A3B (MoE) — 21GB, 2× faster than stock 60-66 tok/s *(speed verified, quality WIP)*
 
 **Target model** (Q4_K_M, 21GB):
 ```
@@ -159,7 +161,7 @@ https://huggingface.co/spiritbuun/Qwen3.6-35B-A3B-DFlash-GGUF
   --cache-ram 0
 ```
 
-#### Qwen3.6-35B-A3B (100-140 tok/s coding)
+#### Qwen3.6-35B-A3B (100-140 tok/s coding) *(speed verified, quality WIP — see note above)*
 
 ```bash
 ./build/bin/llama-server \
