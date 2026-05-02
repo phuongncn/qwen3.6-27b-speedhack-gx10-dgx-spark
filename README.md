@@ -152,10 +152,13 @@ OpenAI-compatible API — works with any client (Open WebUI, Continue.dev, RooCo
 
 The 35B-A3B is a hybrid SSM+Attention model. A one-line fix to the SSM conv state rebuild after draft rejection unlocks clean output at ~1.4× stock speed.
 
-| Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
-|----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding (~600 tok) | 60-66 tok/s | **92-101 tok/s** | **~1.5×** |
-| HTML/JS coding (sustained, ~2000 tok) | 60-66 tok/s | **85-92 tok/s** | **~1.4×** |
+Optimal flags: `--spec-draft-p-min 0.5 --spec-draft-n-max 14` — p_min=0.5 cuts low-confidence drafts early, pushing acceptance rate to ~71% vs 54% at p_min=0.3.
+
+| Scenario | Stock (no DFlash) | DFlash (p_min=0.5) | Speedup |
+|----------|:-----------------:|:-------------------:|:-------:|
+| HTML/JS coding (~600 tok) | 60-66 tok/s | **113 tok/s** | **~1.8×** |
+| HTML/JS coding (sustained, ~2000 tok) | 60-66 tok/s | **96 tok/s** | **~1.5×** |
+| Python coding (~500 tok) | 60-66 tok/s | **83 tok/s** | **~1.3×** |
 | Short chat | 60-66 tok/s | ~44 tok/s | ❌ slower — skip DFlash for chat |
 
 **Target model:** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
