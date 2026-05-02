@@ -148,9 +148,14 @@ OpenAI-compatible API — works with any client (Open WebUI, Continue.dev, RooCo
 | `-ctk` / `-ctv` | turbo4 | TurboQuant scalar KV cache (3.8× compression) |
 | `-cd` | 256 | Draft model context (small = fast, drafter only sees recent tokens) |
 
-## Bonus: Qwen3.6-35B-A3B (MoE) ⚠️ WIP
+## Bonus: Qwen3.6-35B-A3B (MoE) — 92-130 tok/s coding
 
-> **Speed numbers are real (100-140 tok/s coding, ~2× stock), but output quality is currently unreliable.** The 35B-A3B is a hybrid SSM+Attention model — the DFlash draft's cross-attention does not yet correctly handle SSM layers, which can cause corrupted tokens. For production use, run 35B without DFlash (60-66 tok/s, clean output). A fix is being investigated.
+The 35B-A3B is a hybrid SSM+Attention model. A one-line fix to the SSM conv state rebuild after draft rejection unlocks clean output at 2× stock speed.
+
+| Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
+|----------|:-----------------:|:------------------:|:-------:|
+| HTML/JS coding | 60-66 tok/s | **120-130 tok/s** | **~2×** |
+| Python coding | 60-66 tok/s | **92-101 tok/s** | **~1.5×** |
 
 **Target model:** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
 
