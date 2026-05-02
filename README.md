@@ -154,8 +154,9 @@ The 35B-A3B is a hybrid SSM+Attention model. A one-line fix to the SSM conv stat
 
 | Scenario | Stock (no DFlash) | DFlash (optimized) | Speedup |
 |----------|:-----------------:|:------------------:|:-------:|
-| HTML/JS coding | 60-66 tok/s | **120-130 tok/s** | **~2×** |
-| Python coding | 60-66 tok/s | **92-101 tok/s** | **~1.5×** |
+| HTML/JS coding (short, ~600 tok) | 60-66 tok/s | **92-101 tok/s** | **~1.5×** |
+| HTML/JS coding (sustained, ~2000 tok) | 60-66 tok/s | **85-92 tok/s** | **~1.4×** |
+| Short chat (~100 tok) | 60-66 tok/s | **40-50 tok/s** | ~0.7× |
 
 **Target model:** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
 
