@@ -152,7 +152,9 @@ OpenAI-compatible API — works with any client (Open WebUI, Continue.dev, RooCo
 
 > **Speed numbers are real (100-140 tok/s coding, ~2× stock), but output quality is currently unreliable.** The 35B-A3B is a hybrid SSM+Attention model — the DFlash draft's cross-attention does not yet correctly handle SSM layers, which can cause corrupted tokens. For production use, run 35B without DFlash (60-66 tok/s, clean output). A fix is being investigated.
 
-Models: [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) + [spiritbuun/Qwen3.6-35B-A3B-DFlash-GGUF](https://huggingface.co/spiritbuun/Qwen3.6-35B-A3B-DFlash-GGUF)
+**Target model:** [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
+
+**Draft model:** No pre-built GGUF available. Convert from [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) safetensors using `convert_hf_to_gguf.py` from this repo.
 
 ## Credits
 
